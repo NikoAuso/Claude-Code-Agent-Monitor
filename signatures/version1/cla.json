@@ -119,6 +119,14 @@
       "created_at": "2026-08-08T09:48:25Z",
       "repoId": 1173790477,
       "pullRequestNo": 278
+    },
+    {
+      "name": "jiri-capsky",
+      "id": 172509210,
+      "comment_id": 5265980556,
+      "created_at": "2026-08-12T11:18:45Z",
+      "repoId": 1173790477,
+      "pullRequestNo": 282
     }
   ]
 }
