@@ -127,6 +127,14 @@
       "created_at": "2026-08-12T11:18:45Z",
       "repoId": 1173790477,
       "pullRequestNo": 282
+    },
+    {
+      "name": "geunwoobaek",
+      "id": 39114544,
+      "comment_id": 5336704376,
+      "created_at": "2026-08-19T02:17:27Z",
+      "repoId": 1173790477,
+      "pullRequestNo": 297
     }
   ]
 }
