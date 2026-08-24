@@ -1149,6 +1149,7 @@ Consulte [docs/API.md → Metricas](./docs/API.md#metrics) para obtener la lista
 | `POST` | `/api/alerts/ack-all` | Reconocer cada alerta no reconocida                                        |
 | `GET` | `/api/alerts/rules` | Lista de reglas de alertas                                                       |
 | `POST` | `/api/alerts/rules` | Crear una regla (`event_pattern` \| `inactivity` \| `status_duration` \| `token_threshold`) |
+| `POST` | `/api/alerts/rules/preview` | Probar en seco una regla borrador contra el historial registrado: solo lectura, no se guarda ni se notifica nada |
 | `PATCH` | `/api/alerts/rules/:id` | Actualizar nombre / configuración / habilitado / tiempo de espera (el tipo de regla es inmutable) |
 | `ELIMINAR` | `/api/alerts/rules/:id` | Eliminar una regla y su historial de alertas activadas |
 
