@@ -294,7 +294,8 @@ sequenceDiagram
 graph TD
     INDEX[server/index.js<br/>Express app + HTTP server]
     DB[server/db.js<br/>SQLite + prepared statements<br/>better-sqlite3 → node:sqlite fallback]
-    WS[server/websocket.js<br/>WS server + broadcast]
+    WS[server/websocket.js<br/>WS server + broadcast bus]
+    SSE[lib/sse.js<br/>SSE hub — subscribes lazily<br/>to the broadcast bus]
     HOOKS[routes/hooks.js<br/>Hook event processing]
     TC[lib/transcript-cache.js<br/>JSONL cache + incremental reads]
     SESSIONS[routes/sessions.js<br/>Session CRUD]
@@ -312,7 +313,11 @@ graph TD
 
     INDEX --> DB
     INDEX --> WS
+    INDEX -->|closeAllStreams on shutdown| SSE
     INDEX --> HOOKS & SESSIONS & AGENTS & EVENTS & STATS & PRICING & SETTINGS & WORKFLOWS & ALERTSR & WEBHOOKSR
+
+    WS -->|subscribeToBroadcasts| SSE
+    EVENTS -->|GET /api/events/stream| SSE
 
     HOOKS --> DB & WS & TC
     HOOKS --> ALERTS
@@ -333,6 +338,7 @@ graph TD
     style INDEX fill:#6366f1,stroke:#818cf8,color:#fff
     style DB fill:#003B57,stroke:#005f8a,color:#fff
     style WS fill:#10b981,stroke:#34d399,color:#fff
+    style SSE fill:#10b981,stroke:#34d399,color:#fff
 ```
 
 ### Server Components
@@ -352,7 +358,7 @@ graph TD
 | `server/lib/provider-filter.js` | Parses the dashboard-wide `?providers=claude,codex` data scope and composes its SQL predicates with source filtering. |
 | `server/compat-sqlite.js` | Compatibility wrapper that gives Node.js built-in `node:sqlite` (`DatabaseSync`) the same API as `better-sqlite3` — pragma, transaction, prepare. Used as automatic fallback when the native module is unavailable (Node 22+)                                                                                                                                                                                                                                                                                                        |
 | `server/websocket.js`     | WebSocket server on `/ws` path, 30s heartbeat with ping/pong dead connection detection, typed broadcast function. `subscribeToBroadcasts()` exposes the broadcast bus itself so another transport (`lib/sse.js`) can mirror the same stream without touching any of the ~17 `broadcast()` call sites; subscribers are notified independently of `wss`, so streams still work in a process where the WebSocket server was never initialised, and a throwing subscriber is caught rather than allowed to break the primary WS fan-out. Upgrades run through the same Host-header allowlist and optional `DASHBOARD_TOKEN` check as the HTTP surface (`isWebSocketAuthorized`)                                                                                                                                                                                                                                                                                                                                                  |
-| `server/lib/sse.js`       | Server-Sent Events hub behind `GET /api/events/stream`. Subscribes to the broadcast bus lazily (only while at least one client is attached) and emits each envelope as an SSE frame — `event:` carries the message type so `EventSource.addEventListener` works, `id:` is monotonic so `Last-Event-ID` can resume. Holds a 500-message replay ring for reconnects and emits an explicit `stream_gap` event when a client was away longer than the ring covers, rather than silently resuming from a hole. A 25s comment heartbeat keeps proxies from reaping idle streams; a client whose socket stops draining past 1 MiB of queued writes is dropped instead of growing the heap. `DASHBOARD_SSE_MAX_CLIENTS` (default 50) bounds concurrency, `0` disables the endpoint, and `closeAllStreams()` is called on shutdown — open SSE responses would otherwise hold their sockets and stall `httpServer.close()`, the same hazard `closeWebSocket()` exists to avoid |
+| `server/lib/sse.js`       | Server-Sent Events hub behind `GET /api/events/stream`. Subscribes to the broadcast bus lazily (only while at least one client is attached) and emits each envelope as an SSE frame — `event:` carries the message type so `EventSource.addEventListener` works, `id:` is monotonic so `Last-Event-ID` can resume. Holds a 500-message replay ring for reconnects and emits an explicit `stream_gap` event when a client was away longer than the ring covers, rather than silently resuming from a hole. The ring is bound to the subscription: it is discarded when the last client leaves, so events broadcast while zero clients are connected are unrecoverable and the first client back receives no `stream_gap` (the hub has no record of what it missed) — a single-consumer integration must refetch current state over REST after a full disconnect instead of assuming the stream is contiguous. A 25s comment heartbeat keeps proxies from reaping idle streams; a client whose socket stops draining past 1 MiB of queued writes is dropped instead of growing the heap. `DASHBOARD_SSE_MAX_CLIENTS` (default 50) bounds concurrency, `0` disables the endpoint, and `closeAllStreams()` is called on shutdown — open SSE responses would otherwise hold their sockets and stall `httpServer.close()`, the same hazard `closeWebSocket()` exists to avoid |
 | `server/lib/security.js`  | Network-hardening module (fix for GHSA-gr74-4xfh-6jw9). `resolveHost()` picks the bind address. `hostGuard` rejects requests whose `Host` is not loopback, operator-allowlisted, or the Kubernetes `POD_IP`. `DASHBOARD_TOKEN` / `DASHBOARD_TOKEN_FILE` protects REST and WebSocket access. Independent `DASHBOARD_HOOK_TOKEN` / `DASHBOARD_HOOK_TOKEN_FILE` protects `/api/hooks/*` when remote ingestion is enabled. Token matching is constant-time. |
 | `scripts/hook-transport.js` | Shared fail-safe hook delivery for Claude Code and Codex. Defaults to local dashboard discovery, accepts an explicit `CCAM_DASHBOARD_URL`, rejects non-HTTP(S) schemes, requires HTTPS plus `CCAM_HOOK_TOKEN` / `_FILE` for non-loopback destinations, and sends the token as `x-ccam-hook-token` without blocking the agent CLI on the response. |
 | `routes/hooks.js`         | Core event processing inside a SQLite transaction. Auto-creates sessions/agents. Handles 8 hook types: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop, Notification, SessionEnd, plus synthetic `Compaction` events. Manages the agent state machine plus the `awaiting_input_since` overlay (stamped on SessionStart for fresh CLIs — `startup`/`resume`/`clear` only, since a `compact`-source SessionStart fires mid-turn while Claude is working and is deliberately skipped so a working session stays Active — on non-error Stop, and on permission Notifications (which now also set agent status to `waiting`); cleared on UserPromptSubmit / PreToolUse / PostToolUse / SessionStart-resume / SessionEnd; SubagentStop intentionally does NOT clear it; and stamped by the 15 s watchdog on user-interrupt (Esc) recovery — see the `index.js` row — since `Esc` fires no hook). After `res.json()` returns on `SubagentStop`, fires a fire-and-forget `scanAndImportSubagents` (from `scripts/import-history.js`) that parses every `subagents/agent-*.jsonl`, pairs `tool_use` ↔ `tool_result` blocks by `tool_use_id`, and emits per-tool `PreToolUse` + `PostToolUse` events under each subagent's own `agent_id` — closes the gap where subagent-internal tool calls would otherwise never reach the events table. The same scan also reparents nested subagents under their true spawner (see the `import-history.js` row); it returns `{ created, reparented }`, and the follow-up `new_event` refetch nudge fires when **either** is non-zero so a pure re-parent (tree shape changed, no new rows) still refreshes the UI. The same scan attributes each subagent's tokens to **its own model** (resolved from the subagent transcript) and stamps `metadata.model` on the subagent row (issue #185), so a tiered pipeline (Opus orchestrator + Sonnet/Haiku subagents) is priced per real model rather than entirely at the orchestrator's rate; the parent-model bucket is skipped to avoid colliding with the main-transcript token writer's compaction baseline logic. Session reactivation on resume (including Stop/SubagentStop reactivation for imported completed/abandoned sessions), orphaned-session cleanup uses `DASHBOARD_STALE_MINUTES` (default 180). Uses a shared `TranscriptCache` instance (`server/lib/transcript-cache.js`) for extraction of tokens, API errors, turn durations, thinking blocks, usage extras, and the two newest distinct real human prompts — stat-based caching with incremental byte-offset reads avoids re-reading entire JSONL files on every event. That bounded prompt summary is stored in `sessions.card_prompt_preview` and emits `session_updated`, so Claude's compact cards use the same live two-row context as Codex. Detects compaction via `isCompactSummary` in JSONL transcripts and creates compaction agents + events (deduplicated by uuid). Token baselines (`baseline_*` columns) preserve pre-compaction totals so no usage is lost. Cache entries are evicted on SessionEnd. **SessionEnd preserves error state** — but only when the error is still unrecovered at the transcript tail (`isErrorAtTail`: latest API error with no successful turn after it); a transient error the CLI retried past finalizes as `completed` instead of freezing in a stale `error`. **Error recovery**: `UserPromptSubmit` and `PreToolUse` recover a session from `error`; additionally the 15 s watchdog now scans `error` sessions and self-heals one back to `active` when its transcript has progressed past the last API error (`isErrorAtTail` false) — closing the gap where a transient API error left an imported or sweep-monitored session (no live recovery hook) pinned in `error` forever. **Session naming**: on every event, syncs `sessions.name` from the transcript title surfaced by `TranscriptCache` and broadcasts `session_updated` — an explicit `custom-title` (`/rename`, `claude -n`, picker Ctrl+R) always wins, an `ai-title` (auto / plan-accept) only fills a placeholder/auto name (`Session <id8>` or a cwd-folder import name) so a user-chosen name is never clobbered. When neither title exists, the session's **first user prompt** (surfaced by `TranscriptCache` as `firstUserMessage`; tool-result / meta / slash-command plumbing entries skipped) fills the placeholder session name plus the main agent's placeholder name and empty task (issue #201) — a later `ai-title` can still replace a descriptor-filled name, and the agent fill passes the in-flight `current_tool` through (the shared `updateAgent` statement writes that column verbatim) so it is never wiped mid-turn. The guarded `updateSessionName` no-ops on the unchanged case, so the broadcast path stays quiet; the 15 s error-watchdog runs the same sync for idle sessions that fire no hook after a rename. **Dead-session liveness reap**: the same watchdog completes any `active` session whose `cwd` has no running `claude` CLI process (probe via `lib/session-liveness.js`) — recovering a `SessionEnd` lost while the dashboard was down (e.g. Ctrl+C) that previously left the session in Waiting until the 3 h stale sweep; watchdog ticks are gated on the transcript mtime (fallback `updated_at` when no transcript exists) being older than `DASHBOARD_LIVENESS_IDLE_SECONDS` (default 60 s); the boot passes — immediately at startup and again ~5 s later (post-import) — skip the gate so a session quit moments before launch clears at once, disabled via `DASHBOARD_LIVENESS_PROBE=0` / on Windows / in containers, and a false completion self-heals through hook reactivation. Sessions whose `cwd` is not POSIX-absolute (household-hook-forwarded from another machine, e.g. a Windows `D:\…` path a local `/proc`/`lsof` scan can never match) are skipped by the reap — so a mixed local + forwarded deployment stays correct without disabling the whole probe. **Remote Data Source sessions** (`sessions.source` ≠ `local`) are excluded from the reap, the error/interrupt watchdog scan, and both stale sweeps (all gated on `source = 'local'`): their POSIX-absolute `cwd` lives on another machine, so local process/clock heuristics would wrongly terminate a running remote session — their status is reconciled from the SSH mirror by `remote-sync.js` instead |
@@ -456,6 +462,7 @@ flowchart LR
     HOOKS --> WS[WebSocket<br/>Broadcast]
     SESSIONS --> WS
     AGENTS --> WS
+    WS --> SSE["lib/sse.js<br/>SSE mirror<br/>GET /api/events/stream"]
 ```
 
 ---
@@ -1032,7 +1039,9 @@ graph TD
     end
 
     subgraph "Broadcast"
-        BC["broadcast(type, data)<br/>Serializes to JSON,<br/>sends to all OPEN clients"]
+        BC["broadcast(type, data)<br/>Builds one envelope,<br/>fans out to every transport"]
+        SSEH["lib/sse.js hub<br/>(subscribeToBroadcasts)"]
+        SSEC["SSE clients<br/>curl / scripts / EventSource"]
     end
 
     subgraph "Client Handling"
@@ -1048,6 +1057,8 @@ graph TD
 
     A & B & C --> BC
     BC --> WS
+    BC --> SSEH
+    SSEH -->|same envelope| SSEC
     WS --> EB
     EB --> SUB1 & SUB2 & SUB3 & SUB4 & SUB5 & SUB6
     EB --> SUB7["Tabby companion subscriber"]

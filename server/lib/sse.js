@@ -6,6 +6,11 @@
  * real-time stream. Owns the connected-client registry, an optional per-client
  * type filter, a bounded replay buffer for `Last-Event-ID` reconnects, the
  * keep-alive heartbeat, slow-consumer eviction, and shutdown teardown.
+ *
+ * The subscription is lazy: the hub attaches to the broadcast bus on the first
+ * client and detaches on the last, so an unstreamed dashboard does no extra
+ * work. The replay ring is bound to that subscription, which means a period
+ * with zero clients is a permanent gap — see stopBridge() for the contract.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
@@ -116,6 +121,14 @@ function stopBridge() {
   // The buffer only exists to cushion reconnects by live clients. With none
   // connected it is stale by definition, and keeping it would replay ancient
   // events to the next arrival.
+  //
+  // Documented consequence: events broadcast while zero clients are attached are
+  // NOT recoverable, and the first client back gets no `stream_gap` — the hub
+  // was not listening, so it has no record of what it missed. A single-consumer
+  // integration must refetch current state over REST after a full disconnect
+  // rather than assume the stream is contiguous. `stream_gap` covers ring
+  // overflow *while listening*; it is not a completeness guarantee across a gap
+  // in listening. See docs/API.md → Live Event Stream (SSE).
   replayBuffer.length = 0;
 }
 

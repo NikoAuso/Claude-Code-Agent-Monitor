@@ -832,7 +832,7 @@ sequenceDiagram
 
 Not every consumer can open a WebSocket. `curl`, a shell script, a CI job, an automation runner, or a browser behind a proxy that strips `Upgrade` headers all need the same live feed over ordinary HTTP. `server/lib/sse.js` provides it by subscribing to the broadcast bus (`subscribeToBroadcasts()` in `server/websocket.js`) and re-emitting each envelope as an SSE frame:
 
-```
+```text
 id: 17
 event: new_event
 data: {"type":"new_event","data":{ … },"timestamp":"2026-08-24T09:00:00.000Z"}
@@ -840,7 +840,7 @@ data: {"type":"new_event","data":{ … },"timestamp":"2026-08-24T09:00:00.000Z"}
 
 The `data:` payload is byte-identical to what a WebSocket client receives, so the message types below apply unchanged. `?types=new_event,session_updated` narrows the feed server-side.
 
-The hub subscribes lazily — only while at least one client is attached — so a dashboard with no stream consumers does no extra work and keeps no buffer. Reconnects use the standard `Last-Event-ID` header against a 500-message replay ring; when a client was away longer than the ring covers, a `stream_gap` event is emitted before the replay so a hole is never presented as continuity. A `: ping` comment every 25s keeps proxies from reaping idle streams, a consumer that stops draining past 1 MiB of queued writes is dropped rather than allowed to grow the heap, and `DASHBOARD_SSE_MAX_CLIENTS` (default `50`, `0` disables the endpoint) bounds concurrency. Streams are torn down on shutdown alongside the WebSocket clients — an open SSE response holds its socket and would otherwise stall `httpServer.close()`.
+The hub subscribes lazily — only while at least one client is attached — so a dashboard with no stream consumers does no extra work and keeps no buffer. Reconnects use the standard `Last-Event-ID` header against a 500-message replay ring; when a client was away longer than the ring covers, a `stream_gap` event is emitted before the replay so a hole is never presented as continuity. That lazy attachment has a documented cost: the ring is discarded when the last client leaves, so events broadcast while **no** client is connected are not replayable, and the first client back gets no `stream_gap` because the hub has no record of what it missed. A single-consumer integration should refetch current state over REST after any full disconnect rather than treat the stream as contiguous. A `: ping` comment every 25s keeps proxies from reaping idle streams, a consumer that stops draining past 1 MiB of queued writes is dropped rather than allowed to grow the heap, and `DASHBOARD_SSE_MAX_CLIENTS` (default `50`, `0` disables the endpoint) bounds concurrency. Streams are torn down on shutdown alongside the WebSocket clients — an open SSE response holds its socket and would otherwise stall `httpServer.close()`.
 
 ### Message Types
 

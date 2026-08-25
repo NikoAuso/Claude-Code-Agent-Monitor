@@ -274,6 +274,43 @@ describe("SSE event stream", () => {
     resumed.close();
   });
 
+  it("does not replay events broadcast while no client was attached", async () => {
+    // The hub detaches from the bus with its last client and discards the ring,
+    // so a zero-client period is a permanent gap. This is the documented
+    // contract (docs/API.md), not an accident — assert it so a future change to
+    // the lazy-subscription behavior has to update the docs too.
+    const first = await openStream("/api/events/stream");
+    await flush();
+    broadcast("new_event", { id: 300 });
+    await flush();
+    const lastId = first
+      .frames()
+      .map(parseFrame)
+      .find((f) => f.event === "new_event").id;
+    first.close();
+    await flush();
+    assert.equal(getStreamClientCount(), 0);
+
+    // Broadcast into an empty hub — nothing is buffered.
+    broadcast("new_event", { id: 301 });
+    await flush();
+
+    const resumed = await openStream("/api/events/stream", {
+      "Last-Event-ID": String(lastId),
+    });
+    await flush();
+
+    const frames = resumed.frames().map(parseFrame);
+    assert.equal(
+      frames.filter((f) => f.event === "new_event").length,
+      0,
+      "events broadcast with no client attached must not be replayed"
+    );
+    // And no stream_gap either — the hub has no record of what it missed.
+    assert.equal(frames.filter((f) => f.event === "stream_gap").length, 0);
+    resumed.close();
+  });
+
   it("signals stream_gap when the requested Last-Event-ID predates the buffer", async () => {
     const live = await openStream("/api/events/stream");
     await flush();

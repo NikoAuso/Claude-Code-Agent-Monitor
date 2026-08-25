@@ -707,7 +707,7 @@ Streams the same realtime messages the WebSocket endpoint broadcasts, as [Server
 
 **Frame format:**
 
-```
+```text
 id: 17
 event: new_event
 data: {"type":"new_event","data":{"id":42,"tool_name":"Bash"},"timestamp":"2026-08-24T09:00:00.000Z"}
@@ -721,12 +721,14 @@ data: {"type":"new_event","data":{"id":42,"tool_name":"Bash"},"timestamp":"2026-
 
 **Reconnecting:** browsers resend the last seen id as `Last-Event-ID` automatically; other clients should do the same. Anything still held in the 500-message replay buffer is re-sent. If the client was away longer than the buffer covers, a `stream_gap` event is emitted **before** the replay so the gap is never silent:
 
-```
+```text
 event: stream_gap
 data: {"last_event_id":4,"oldest_available_id":812,"message":"Some events were dropped from the replay buffer; refetch via the REST API."}
 ```
 
 Treat `stream_gap` as "resynchronize over REST" — the stream is live again, but it is not complete.
+
+**The buffer only exists while someone is listening.** The hub attaches to the broadcast bus on the first client and detaches — discarding the ring — when the last one leaves, so a dashboard nobody is streaming does no extra work and never accumulates a buffer to replay. The consequence is that events broadcast during a period with **zero** connected clients are not recoverable: a `Last-Event-ID` sent by the first client back after a full disconnect resumes from an empty ring, and no `stream_gap` is emitted because the hub has no record of what it missed. After any reconnect where your process was the only consumer, refetch current state over REST (`/api/sessions`, `/api/events`) rather than assuming the stream is contiguous. `stream_gap` covers overflow while listening; it is not a completeness guarantee across a gap in listening.
 
 **Example Request:**
 
