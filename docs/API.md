@@ -998,7 +998,7 @@ Backtests a candidate rule **without saving it**. The request is strictly read-o
 | `config` | object | — | Same shape and validation as `POST /api/alerts/rules` |
 | `name` | string | `"Preview"` | Used only to render the sample messages |
 | `lookback_hours` | number | `24` | History window for replayed rule types; clamped to 720 |
-| `cooldown_seconds` | integer | `300` | Cooldown to simulate while replaying |
+| `cooldown_seconds` | integer | `300` | Cooldown to simulate while replaying. Validated as a non-negative integer; deliberately **not** capped, so any cooldown a real rule can carry is previewable |
 | `limit` | integer | `20` | Max sample firings returned; clamped to 200 |
 
 **Example Request:**
@@ -1049,6 +1049,10 @@ curl -X POST http://localhost:4820/api/alerts/rules/preview \
 
 - `"history"` — `event_pattern` rules are replayed over recorded events, reproducing the live per-session count-in-window check and simulating the cooldown.
 - `"current_state"` — `inactivity`, `status_duration` and `token_threshold` have no reconstructible history (`token_usage` stores running totals, not a per-instant series), so the response reports what matches *right now*. `triggered_at` is `null` on those samples.
+
+For `token_threshold`, `lookback_hours` still applies — but as a **candidate filter**, not a replay window, echoed back as `candidate_window_hours`. The rule is only evaluated when a token-bearing event arrives, and `sessions.updated_at` moves on every ingested event, so a session idle beyond the window can no longer fire the rule however large its stored total is. Listing it would report a match that provably cannot happen, so it is excluded. The totals themselves are always current.
+
+`summary_contains` is a **literal** substring, matching the live engine's `String#includes` semantics. `%`, `_` and the escape character are escaped and an `ESCAPE` clause is applied, so `summary_contains: "%"` matches only summaries that literally contain a percent sign rather than every non-null summary.
 
 `truncated: true` means the scan hit its 20 000-row ceiling and the counts are a lower bound — narrow the pattern or shorten `lookback_hours`.
 

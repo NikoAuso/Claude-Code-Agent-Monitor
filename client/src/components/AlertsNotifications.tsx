@@ -69,7 +69,7 @@
  *
  * ----------------------------------------------------------------------------- */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { useTranslation } from "react-i18next";
 import {
@@ -239,6 +239,11 @@ export function AlertsNotifications() {
   const [preview, setPreview] = useState<AlertRulePreview | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [previewLookback, setPreviewLookback] = useState(24);
+  // Monotonic id for the in-flight preview request. Editing the form clears the
+  // result, but a response already on the wire would otherwise land afterwards
+  // and repopulate the panel with numbers describing the *previous* draft. Only
+  // the response whose id still matches is applied.
+  const previewRequestId = useRef(0);
 
   // Feed
   const [alerts, setAlerts] = useState<AlertEvent[]>([]);
@@ -311,12 +316,15 @@ export function AlertsNotifications() {
   }, [loadAlerts]);
 
   const set = (patch: Partial<RuleFormState>) => {
+    // Invalidate any in-flight preview along with the displayed one.
+    previewRequestId.current += 1;
     setPreview(null);
     setForm((prev) => ({ ...prev, ...patch }));
   };
 
   const onPreviewRule = async () => {
     if (previewing) return;
+    const requestId = ++previewRequestId.current;
     setPreviewing(true);
     setFormError(null);
     try {
@@ -328,12 +336,14 @@ export function AlertsNotifications() {
         lookback_hours: previewLookback,
         cooldown_seconds: Number.isFinite(cooldown) && cooldown >= 0 ? cooldown : 300,
       });
+      if (previewRequestId.current !== requestId) return; // superseded — drop it
       setPreview(res.preview);
     } catch (err) {
+      if (previewRequestId.current !== requestId) return;
       setPreview(null);
       setFormError(err instanceof Error ? err.message : String(err));
     } finally {
-      setPreviewing(false);
+      if (previewRequestId.current === requestId) setPreviewing(false);
     }
   };
 
@@ -350,6 +360,7 @@ export function AlertsNotifications() {
         cooldown_seconds: Number.isFinite(cooldown) && cooldown >= 0 ? cooldown : 300,
       });
       setForm(EMPTY_FORM);
+      previewRequestId.current += 1;
       setPreview(null);
       setFormOpen(false);
       loadRules();
@@ -481,6 +492,7 @@ export function AlertsNotifications() {
               onClick={() => {
                 setFormOpen((open) => !open);
                 setFormError(null);
+                previewRequestId.current += 1;
                 setPreview(null);
               }}
               className="btn-ghost border border-border inline-flex items-center gap-1.5 text-xs flex-shrink-0"
@@ -698,6 +710,7 @@ export function AlertsNotifications() {
                     <select
                       value={previewLookback}
                       onChange={(e) => {
+                        previewRequestId.current += 1;
                         setPreviewLookback(Number(e.target.value));
                         setPreview(null);
                       }}
@@ -756,7 +769,11 @@ export function AlertsNotifications() {
                   <p className="text-[11px] text-gray-500">
                     {preview.evaluated === "history"
                       ? t("rules.preview.history", { hours: preview.lookback_hours })
-                      : t("rules.preview.currentState")}
+                      : preview.candidate_window_hours != null
+                        ? t("rules.preview.currentStateTokens", {
+                            hours: preview.candidate_window_hours,
+                          })
+                        : t("rules.preview.currentState")}
                     {preview.truncated ? ` ${t("rules.preview.truncated")}` : ""}
                   </p>
 

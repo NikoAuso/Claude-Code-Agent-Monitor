@@ -1551,6 +1551,11 @@ export interface AlertRulePreview {
   evaluated: "history" | "current_state";
   /** History window actually used (after clamping), in hours. */
   lookback_hours: number;
+  /** token_threshold only: the activity window used to pick *candidate* sessions.
+   *  Totals themselves are current — a session with no events inside this window
+   *  can no longer fire the rule, so it is excluded rather than reported as a
+   *  match that cannot happen. Absent for every other rule type. */
+  candidate_window_hours?: number;
   /** Cooldown that was simulated, in seconds. */
   cooldown_seconds: number;
   /** ISO start of the evaluated window. */

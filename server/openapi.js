@@ -2999,7 +2999,7 @@ function createOpenApiSpec() {
           tags: ["Alerts"],
           summary: "Dry-run an alert rule against recorded history (read-only)",
           description:
-            "Backtests a candidate rule without saving it. Nothing is persisted, broadcast, or delivered to webhooks. event_pattern rules are replayed over historical events (including the per-session count-in-window and a simulated cooldown); inactivity, status_duration and token_threshold are evaluated against current state, indicated by preview.evaluated.",
+            "Backtests a candidate rule without saving it. Nothing is persisted, broadcast, or delivered to webhooks. event_pattern rules are replayed over historical events (including the per-session count-in-window and a simulated cooldown); inactivity, status_duration and token_threshold are evaluated against current state, indicated by preview.evaluated. For token_threshold the lookback acts as a candidate filter (echoed as preview.candidate_window_hours), not a replay window: a session idle beyond it can no longer fire the rule. summary_contains is matched as a literal substring \u2014 SQL LIKE metacharacters are escaped.",
           operationId: "previewAlertRule",
           requestBody: {
             required: true,

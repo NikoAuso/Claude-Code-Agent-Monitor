@@ -102,6 +102,12 @@ before(async () => {
   insertEvent.run(SESSION_A, null, "PreToolUse", "Read", "read a file", ago(45));
   // An old event well outside a 1h lookback.
   insertEvent.run(SESSION_A, null, "PreToolUse", "Bash", "stale call", ago(60 * 60 * 40));
+  // Summaries that expose SQL LIKE metacharacter handling: only the first
+  // literally contains "%", and only the third literally contains "a_b".
+  insertEvent.run(SESSION_A, null, "Notification", "Edit", "100% coverage", ago(40));
+  insertEvent.run(SESSION_A, null, "Notification", "Edit", "no percent here", ago(39));
+  insertEvent.run(SESSION_A, null, "Notification", "Edit", "value a_b set", ago(38));
+  insertEvent.run(SESSION_A, null, "Notification", "Edit", "value axb set", ago(37));
 
   db.prepare(
     "INSERT INTO token_usage (session_id, model, input_tokens, output_tokens) VALUES (?, ?, ?, ?)"
@@ -250,6 +256,31 @@ describe("Alert rule preview — event_pattern replay", () => {
     assert.equal(res.body.preview.samples[0].session_id, SESSION_B);
   });
 
+  it("treats % in summary_contains as a literal, not a SQL wildcard", async () => {
+    const res = await post("/api/alerts/rules/preview", {
+      rule_type: "event_pattern",
+      config: { event_type: "Notification", summary_contains: "%" },
+      lookback_hours: 1,
+      cooldown_seconds: 0,
+    });
+    // Exactly one seeded Notification summary contains a literal "%". Without
+    // an ESCAPE clause the LIKE pattern would match all four.
+    assert.equal(res.body.preview.matched_count, 1);
+    assert.match(res.body.preview.samples[0].details.summary, /100% coverage/);
+  });
+
+  it("treats _ in summary_contains as a literal, not a single-character wildcard", async () => {
+    const res = await post("/api/alerts/rules/preview", {
+      rule_type: "event_pattern",
+      config: { event_type: "Notification", summary_contains: "a_b" },
+      lookback_hours: 1,
+      cooldown_seconds: 0,
+    });
+    // "value a_b set" matches literally; "value axb set" must not.
+    assert.equal(res.body.preview.matched_count, 1);
+    assert.match(res.body.preview.samples[0].details.summary, /a_b/);
+  });
+
   it("caps returned samples at the requested limit without changing the counts", async () => {
     const res = await post("/api/alerts/rules/preview", {
       rule_type: "event_pattern",
@@ -299,6 +330,41 @@ describe("Alert rule preview — current-state rules", () => {
     assert.equal(p.matched_count, 1);
     assert.equal(p.samples[0].session_id, SESSION_A);
     assert.equal(p.samples[0].details.total_tokens, 1_000_000);
+  });
+
+  it("reports the candidate activity window it used for a token threshold", async () => {
+    const res = await post("/api/alerts/rules/preview", {
+      rule_type: "token_threshold",
+      config: { total_tokens: 500_000 },
+      lookback_hours: 24,
+    });
+    // The lookback is a candidate filter here, not a replay window, and the
+    // response says so rather than leaving the client to infer it.
+    assert.equal(res.body.preview.candidate_window_hours, 24);
+  });
+
+  it("excludes a session that can no longer fire a token rule", async () => {
+    // Session B has been idle for two hours and receives no token-bearing
+    // events, so evaluateEvent can never fire a token rule for it again.
+    db.prepare(
+      "INSERT INTO token_usage (session_id, model, input_tokens, output_tokens) VALUES (?, ?, ?, ?)"
+    ).run(SESSION_B, "claude-opus-5", 5_000_000, 1_000_000);
+
+    const wide = await post("/api/alerts/rules/preview", {
+      rule_type: "token_threshold",
+      config: { total_tokens: 500_000 },
+      lookback_hours: 24,
+    });
+    assert.equal(wide.body.preview.matched_count, 2);
+
+    const narrow = await post("/api/alerts/rules/preview", {
+      rule_type: "token_threshold",
+      config: { total_tokens: 500_000 },
+      lookback_hours: 1,
+    });
+    const ids = narrow.body.preview.samples.map((sample) => sample.session_id);
+    assert.deepEqual(ids, [SESSION_A]);
+    assert.equal(narrow.body.preview.candidate_window_hours, 1);
   });
 
   it("reports nothing for a token threshold above every session", async () => {

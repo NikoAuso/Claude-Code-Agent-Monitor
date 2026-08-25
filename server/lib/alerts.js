@@ -159,6 +159,20 @@ function fireAlert(rule, { sessionId = null, agentId = null, message, details = 
   return alert;
 }
 
+// `summary_contains` is a literal substring in the rule's contract — matchesPattern
+// implements it with String#includes. SQL LIKE, however, treats `%` and `_` as
+// wildcards, so an unescaped pattern silently widens the match: `summary_contains:
+// "%"` would hit every non-null summary, and `a_b` would also match `axb`. Escaping
+// the metacharacters (and the escape character itself) keeps every SQL path
+// agreeing with matchesPattern.
+const LIKE_ESCAPE_CHAR = "\\";
+const LIKE_ESCAPE_CLAUSE = `ESCAPE '${LIKE_ESCAPE_CHAR}'`;
+
+function likeContains(value) {
+  const escaped = value.toLowerCase().replace(/[\\%_]/g, (ch) => `${LIKE_ESCAPE_CHAR}${ch}`);
+  return `%${escaped}%`;
+}
+
 // Dynamic count-in-window queries vary by which pattern fields a rule sets;
 // cache prepared statements by their SQL so hot rules don't re-prepare.
 const countStmtCache = new Map();
@@ -175,8 +189,8 @@ function countMatchingEvents(sessionId, cfg) {
     params.push(cfg.tool_name);
   }
   if (cfg.summary_contains) {
-    where.push("LOWER(COALESCE(summary, '')) LIKE ?");
-    params.push(`%${cfg.summary_contains.toLowerCase()}%`);
+    where.push(`LOWER(COALESCE(summary, '')) LIKE ? ${LIKE_ESCAPE_CLAUSE}`);
+    params.push(likeContains(cfg.summary_contains));
   }
   const sql = `SELECT COUNT(*) as count FROM events WHERE ${where.join(" AND ")}`;
   let stmt = countStmtCache.get(sql);
@@ -385,8 +399,8 @@ function previewEventPattern(cfg, { since, ruleName, cooldownSeconds, sampleLimi
     params.push(cfg.tool_name);
   }
   if (cfg.summary_contains) {
-    where.push("LOWER(COALESCE(e.summary, '')) LIKE ?");
-    params.push(`%${cfg.summary_contains.toLowerCase()}%`);
+    where.push(`LOWER(COALESCE(e.summary, '')) LIKE ? ${LIKE_ESCAPE_CLAUSE}`);
+    params.push(likeContains(cfg.summary_contains));
   }
 
   const rows = preparedCached(
@@ -470,8 +484,16 @@ function previewEventPattern(cfg, { since, ruleName, cooldownSeconds, sampleLimi
  * moment a session first crossed the threshold is not recoverable — reporting
  * which sessions sit above it today is the honest answer, and callers get
  * `evaluated: "current_state"` so the UI can say so.
+ *
+ * The lookback still applies, but as a *candidate filter* rather than a replay
+ * window: evaluateEvent only tests this rule when a token-bearing event arrives,
+ * and sessions.updated_at is bumped on every ingested event, so a session with
+ * no activity inside the window can no longer fire the rule no matter how large
+ * its stored total is. Listing those would report matches that provably cannot
+ * happen. Callers are told which sessions were considered via
+ * `candidate_window_hours` on the result.
  */
-function previewTokenThreshold(cfg, { since, ruleName, sampleLimit }) {
+function previewTokenThreshold(cfg, { since, ruleName, sampleLimit, lookbackHours }) {
   const rows = preparedCached(
     `SELECT s.id AS session_id, s.name AS session_name,
             COALESCE(SUM(t.input_tokens), 0) + COALESCE(SUM(t.output_tokens), 0)
@@ -487,6 +509,9 @@ function previewTokenThreshold(cfg, { since, ruleName, sampleLimit }) {
 
   return {
     evaluated: "current_state",
+    // Surfaced so a client never has to infer why the lookback control changes
+    // this rule type's results even though the totals themselves are current.
+    candidate_window_hours: lookbackHours,
     matched_count: rows.length,
     would_fire_count: rows.length,
     suppressed_by_cooldown: 0,
@@ -579,7 +604,7 @@ function previewRule(ruleType, config, opts = {}) {
   const ruleName =
     typeof opts.name === "string" && opts.name.trim() ? opts.name.trim() : PREVIEW_RULE_NAME;
   const since = isoSince(lookbackHours);
-  const ctx = { since, ruleName, cooldownSeconds, sampleLimit };
+  const ctx = { since, ruleName, cooldownSeconds, sampleLimit, lookbackHours };
 
   let result;
   if (ruleType === "event_pattern") result = previewEventPattern(cfg, ctx);

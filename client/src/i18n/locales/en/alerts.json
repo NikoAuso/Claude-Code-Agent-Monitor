@@ -62,6 +62,7 @@
       "suppressed": "suppressed by cooldown:",
       "history": "Replayed over the last {{hours}}h of recorded events.",
       "currentState": "This rule type has no replayable history — showing what matches right now.",
+      "currentStateTokens": "Totals are current. Only sessions with activity in the last {{hours}}h are considered — a session with no recent events can no longer fire this rule.",
       "truncated": "Scan limit reached, so the counts are a lower bound.",
       "none": "No matches — this rule would not have fired.",
       "more": "+{{extra}} more not shown"
