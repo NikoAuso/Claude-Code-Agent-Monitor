@@ -471,6 +471,60 @@ describe("Codex rollout ingestor", () => {
       return db.prepare("SELECT * FROM events WHERE session_id = ? ORDER BY id").all(sessionId);
     }
 
+    /**
+     * Replay the captured `codex exec --ephemeral` hook sequence for one session
+     * id. Each test drives its own so none depends on the order the runner
+     * happens to pick (`--test-name-pattern` can select a single case).
+     */
+    function runEphemeralSession(sessionId, { stop = true, end = true } = {}) {
+      const own = { ...base, session_id: sessionId };
+      ingestCodexHook(null, "SessionStart", {
+        ...own,
+        hook_event_name: "SessionStart",
+        model: "gpt-5.6-sol",
+        source: "startup",
+      });
+      ingestCodexHook(null, "UserPromptSubmit", {
+        ...own,
+        turn_id: TURN_ID,
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Run the shell command 'echo hello-ccam' and then reply DONE.",
+      });
+      ingestCodexHook(null, "PreToolUse", {
+        ...own,
+        turn_id: TURN_ID,
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "echo hello-ccam" },
+        tool_use_id: "exec-3c2ba208-b1e2-4980-8d9e-756175454f02",
+      });
+      ingestCodexHook(null, "PostToolUse", {
+        ...own,
+        turn_id: TURN_ID,
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "echo hello-ccam" },
+        tool_response: "hello-ccam\n",
+        tool_use_id: "exec-3c2ba208-b1e2-4980-8d9e-756175454f02",
+      });
+      if (stop) {
+        ingestCodexHook(null, "Stop", {
+          ...own,
+          turn_id: TURN_ID,
+          hook_event_name: "Stop",
+          last_assistant_message: "DONE",
+        });
+      }
+      if (end) {
+        ingestCodexHook(null, "SessionEnd", {
+          ...own,
+          hook_event_name: "SessionEnd",
+          reason: "other",
+        });
+      }
+      return sessionId;
+    }
+
     it("runs the full lifecycle from hooks alone and lands on completed", () => {
       const started = ingestCodexHook(null, "SessionStart", {
         ...base,
@@ -537,7 +591,7 @@ describe("Codex rollout ingestor", () => {
     });
 
     it("rebuilds the turn's history from the hook payloads", () => {
-      const rows = eventsFor(EPHEMERAL_ID);
+      const rows = eventsFor(runEphemeralSession("01a040d0-0001-7000-8000-000000000001"));
       assert.deepEqual(
         rows.map((row) => row.event_type),
         [
@@ -560,7 +614,8 @@ describe("Codex rollout ingestor", () => {
     });
 
     it("marks the session hook-only so the UI can explain the missing transcript", () => {
-      const metadata = JSON.parse(stmts.getSession.get(EPHEMERAL_ID).metadata);
+      const sessionId = runEphemeralSession("01a040d0-0002-7000-8000-000000000002");
+      const metadata = JSON.parse(stmts.getSession.get(sessionId).metadata);
       assert.equal(metadata.hook_only, true);
       assert.equal(metadata.provider, "codex", "the pre-existing metadata keys survive");
     });
@@ -789,12 +844,38 @@ describe("Codex rollout ingestor", () => {
     });
 
     it("leaves a rollout-backed session out of the hook-only fallback", () => {
-      assert.equal(
-        reconcileCodexSessionLiveness({ hookOnlyIdleMs: 0 }).some(
-          (result) => result.session.transcript_path
-        ),
-        false
+      // Build the session this asserts on rather than relying on one an earlier
+      // test happened to leave behind — otherwise it can pass simply because no
+      // rollout-backed session exists.
+      const sessionId = "01a040d0-0003-7000-8000-000000000003";
+      const rollout = path.join(
+        process.env.DASHBOARD_CODEX_HOME,
+        "sessions",
+        "2026",
+        "08",
+        "06",
+        `rollout-2026-08-06T09-00-00-${sessionId}.jsonl`
       );
+      fs.mkdirSync(path.dirname(rollout), { recursive: true });
+      fs.writeFileSync(
+        rollout,
+        `${[
+          JSON.stringify(
+            record("session_meta", { id: sessionId, cwd: "/workspace/rollout-backed" })
+          ),
+          JSON.stringify(record("event_msg", { type: "task_complete", message: "done" })),
+        ].join("\n")}\n`
+      );
+      ingestCodexTranscript(rollout);
+      const before = stmts.getSession.get(sessionId);
+      assert.equal(before.status, "active");
+      assert.ok(before.transcript_path, "the fixture is genuinely rollout-backed");
+
+      reconcileCodexSessionLiveness({ hookOnlyIdleMs: 0 });
+
+      const after = stmts.getSession.get(sessionId);
+      assert.equal(after.status, "active", "a rollout-backed session is never hook-reaped");
+      assert.notEqual(stmts.getAgent.get(`codex:${sessionId}`).status, "completed");
     });
   });
 });
