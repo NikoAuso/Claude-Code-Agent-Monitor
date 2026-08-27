@@ -725,6 +725,33 @@ describe("Codex rollout ingestor", () => {
       );
     });
 
+    it("still records the turn when the main agent row is missing", () => {
+      // events.agent_id is a FOREIGN KEY; attributing a row to an absent agent
+      // would throw inside the fail-safe hook path and lose the notification.
+      const sessionId = "01a04203-5555-7000-8000-555555555555";
+      ingestCodexHook(null, "SessionStart", {
+        session_id: sessionId,
+        transcript_path: null,
+        cwd: "/workspace/orphan-agent",
+        hook_event_name: "SessionStart",
+      });
+      db.prepare("DELETE FROM agents WHERE id = ?").run(`codex:${sessionId}`);
+
+      const result = ingestCodexHook(null, "UserPromptSubmit", {
+        session_id: sessionId,
+        transcript_path: null,
+        hook_event_name: "UserPromptSubmit",
+        prompt: "orphaned but recorded",
+      });
+      assert.equal(result.changed, true);
+      const rows = db
+        .prepare("SELECT * FROM events WHERE session_id = ? ORDER BY id")
+        .all(sessionId);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].summary, "orphaned but recorded");
+      assert.equal(rows[0].agent_id, null, "the event is unattributed rather than lost");
+    });
+
     it("no longer rejects a transcript-less hook at the route", async () => {
       const express = require("express");
       const app = express();

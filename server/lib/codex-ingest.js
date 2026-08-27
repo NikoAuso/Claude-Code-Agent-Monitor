@@ -974,11 +974,17 @@ function setSessionMetadataFlag(sessionId, key, value) {
  */
 function persistCodexHookEvents(sessionId, hookType, data) {
   const agentId = `codex:${sessionId}`;
+  // events.agent_id is a FOREIGN KEY. Attributing a row to a main agent that is
+  // missing (a partially deleted session, a row from an older build) would throw
+  // inside the fail-safe hook path and silently drop the notification — the very
+  // failure this whole path exists to remove. The column is nullable, so fall
+  // back to an unattributed event rather than losing the turn.
+  const attributedAgentId = stmts.getAgent.get(agentId) ? agentId : null;
   const turnId = typeof data?.turn_id === "string" ? data.turn_id : null;
   const insert = (eventType, tool, summary, extra) => {
     const info = stmts.insertEvent.run(
       sessionId,
-      agentId,
+      attributedAgentId,
       eventType,
       tool,
       summary,
