@@ -703,7 +703,7 @@ Every event row — on the Dashboard's Recent Activity panel, the Activity Feed,
 | **Completed** | `Stop`, `SessionEnd`, `SubagentStop`, `Compaction`, `codex_task_complete`, `codex_context_compacted` |
 | **Error** | `error`, `APIError`, `codex_error` |
 
-`Stop` is **Completed** on every surface — it is a turn boundary, and the shipped filter help has always described it that way. The Dashboard adds one rule on top through `activityStatusFromEvent`: a summary that reports a failure is an Error whatever the event type says. `STATUS_TO_EVENT_TYPES` in `EventFilters.tsx` is the exact inverse of this table (the Working/Completed/Error filter presets), and a test asserts the two never drift.
+`Stop` is **Completed** on every surface — it is a turn boundary, and the shipped filter help has always described it that way. The Dashboard adds one rule on top through `activityStatusFromEvent`: a summary that reports a failure is an Error whatever the event type says. `STATUS_TO_EVENT_TYPES` in `EventFilters.tsx` inverts the *filterable* rows of this table — every type it lists badges as the status it is filed under, and a test asserts the two never drift. It deliberately omits the lifecycle/metadata types that reach **Waiting** only through the default (`SessionStart`, `Notification`, `TurnDuration`, `codex_turn_aborted`), since filtering on those would return rows the user did not ask for; that is also why the "Idle" preset expands to nothing.
 
 ### Workflows Page Architecture
 

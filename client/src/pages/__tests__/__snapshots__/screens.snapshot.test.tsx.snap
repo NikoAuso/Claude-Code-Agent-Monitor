@@ -228,7 +228,7 @@ exports[`screen snapshots > Activity feed 1`] = `
                 <dd
                   class="self-center"
                 >
-                  eventFilters.help.statusWaitingDesc
+                  A tool returned and the turn continues, or the event is lifecycle/metadata with no reliable progress meaning (PostToolUse, the codex_*_end tool results, SessionStart, Notification, TurnDuration, codex_turn_aborted).
                 </dd>
                 <dt>
                   <span
@@ -292,7 +292,7 @@ exports[`screen snapshots > Activity feed 1`] = `
               <code
                 class="block bg-black/40 border border-border rounded p-2 text-[11px] font-mono text-gray-300 whitespace-pre-wrap"
               >
-                PreToolUse (Working) → PostToolUse (Connected) → ... → Stop (Completed)
+                PreToolUse (Working) → PostToolUse (Waiting) → ... → Stop (Completed)
               </code>
             </div>
           </details>
@@ -329,7 +329,7 @@ exports[`screen snapshots > Activity feed 1`] = `
                 <li
                   class="text-amber-300/90"
                 >
-                  Grouping tip: a grouped row needs both Pre and Post events. If you filter by Status, pick Working + Connected together to keep pairs intact - otherwise a group will only show half of the call.
+                  Grouping tip: a grouped row needs both Pre and Post events. If you filter by Status, pick Working + Waiting together to keep pairs intact - otherwise a group will only show half of the call.
                 </li>
                 <li>
                   Text search matches summary, tool_name, and the raw payload (data column).

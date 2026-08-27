@@ -134,13 +134,18 @@ export function isEmptyFilters(f: EventFiltersValue): boolean {
   );
 }
 
-// Status preset → event_type values. The exact inverse of `statusFromEventType`
-// in lib/event-grouping, which paints the badge on every event row — keep the
-// two in lock-step or a preset silently stops matching what the user can see.
-// Codex-native types are included, without which the presets never matched a
-// Codex row at all (issue #310). "Idle" is handled as everything not covered by
-// the other presets, which translates to an empty preset that doesn't restrict
-// the query (same as no selection).
+// Status preset → event_type values. Inverts the FILTERABLE rows of
+// `statusFromEventType` in lib/event-grouping, which paints the badge on every
+// event row: every type listed here must badge as the status it is filed under,
+// or a preset silently stops matching what the user can see (a test asserts
+// exactly that). Codex-native types are included, without which the presets
+// never matched a Codex row at all (issue #310).
+//
+// The lifecycle/metadata types that reach "waiting" only through the mapping's
+// default — SessionStart, Notification, TurnDuration, codex_turn_aborted — are
+// deliberately absent, since filtering on them would return rows the user did
+// not ask for. That is also why "Idle" expands to nothing and therefore does
+// not restrict the query (same as no selection).
 export const STATUS_TO_EVENT_TYPES: Record<string, string[]> = {
   working: [
     "PreToolUse",
