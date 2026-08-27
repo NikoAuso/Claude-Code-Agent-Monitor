@@ -621,7 +621,7 @@ describe("Codex rollout ingestor", () => {
       );
     });
 
-    it("retires a hook-only session whose SessionEnd was lost", () => {
+    it("retires a hook-only session whose Stop was never answered by SessionEnd", () => {
       const sessionId = "01a04200-2222-7000-8000-222222222222";
       ingestCodexHook(null, "SessionStart", {
         session_id: sessionId,
@@ -650,6 +650,79 @@ describe("Codex rollout ingestor", () => {
       assert.ok(repaired.some((result) => result.session.id === sessionId));
       assert.equal(stmts.getSession.get(sessionId).status, "completed");
       assert.equal(stmts.getAgent.get(`codex:${sessionId}`).status, "completed");
+    });
+
+    // The reason silence alone can never be the trigger: a rollout-less run
+    // emits NO hooks for the whole of a tool call. A captured `sleep 12`
+    // produced a 12,119 ms PreToolUse→PostToolUse gap, and a CI build or test
+    // suite is unbounded — an idle-time rule would complete a live run.
+    it("never retires a hook-only session that is mid-tool, however long it is quiet", () => {
+      const sessionId = "01a04201-3333-7000-8000-333333333333";
+      ingestCodexHook(null, "SessionStart", {
+        session_id: sessionId,
+        transcript_path: null,
+        cwd: "/workspace/slow-build",
+        hook_event_name: "SessionStart",
+      });
+      ingestCodexHook(null, "PreToolUse", {
+        session_id: sessionId,
+        transcript_path: null,
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "npm run build" },
+      });
+      assert.equal(stmts.getAgent.get(`codex:${sessionId}`).status, "working");
+
+      // Even with the window fully elapsed, a working turn is untouchable.
+      const swept = reconcileCodexSessionLiveness({ hookOnlyIdleMs: 0, workingIdleMs: 10_000_000 });
+      assert.equal(
+        swept.some((result) => result.session.id === sessionId),
+        false
+      );
+      assert.equal(stmts.getSession.get(sessionId).status, "active");
+      assert.equal(stmts.getAgent.get(`codex:${sessionId}`).status, "working");
+
+      // The build finishes minutes later and the session carries on normally.
+      ingestCodexHook(null, "PostToolUse", {
+        session_id: sessionId,
+        transcript_path: null,
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "npm run build" },
+        tool_response: "built",
+      });
+      assert.equal(stmts.getSession.get(sessionId).status, "active");
+    });
+
+    it("does not promote the idle-working guess into a terminal state", () => {
+      const sessionId = "01a04202-4444-7000-8000-444444444444";
+      ingestCodexHook(null, "SessionStart", {
+        session_id: sessionId,
+        transcript_path: null,
+        cwd: "/workspace/silent-turn",
+        hook_event_name: "SessionStart",
+      });
+      ingestCodexHook(null, "PreToolUse", {
+        session_id: sessionId,
+        transcript_path: null,
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command: "sleep 600" },
+      });
+
+      // The 90 s idle-working heuristic parks it in Waiting/interrupted. That
+      // is the dashboard's own inference, not something Codex reported, so it
+      // must never cascade into `completed`.
+      reconcileCodexSessionLiveness({ workingIdleMs: 0, hookOnlyIdleMs: 0 });
+      assert.equal(stmts.getSession.get(sessionId).awaiting_reason, "interrupted");
+      assert.equal(stmts.getSession.get(sessionId).status, "active");
+
+      reconcileCodexSessionLiveness({ workingIdleMs: 0, hookOnlyIdleMs: 0 });
+      assert.equal(
+        stmts.getSession.get(sessionId).status,
+        "active",
+        "an interrupted guess never becomes a terminal state on its own"
+      );
     });
 
     it("no longer rejects a transcript-less hook at the route", async () => {

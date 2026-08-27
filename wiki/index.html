@@ -1997,9 +1997,9 @@ npm run mcp:start:repl         # interactive CLI with tab completion</code></pre
                   <td>Safety-net interval (ms) for incremental Codex rollout scanning. Default <code>4000</code>; <code>0</code> disables polling but keeps the watcher.</td>
                 </tr>
                 <tr>
-                  <td><code>DASHBOARD_CODEX_HOOK_IDLE_MINUTES</code></td>
-                  <td><code>10</code></td>
-                  <td>Silence window before a hook-only Codex session is retired. A run started with <code>codex exec --ephemeral</code> writes no rollout, so it has neither a transcript mtime nor an open file for the liveness probes, and a lost fire-and-forget <code>SessionEnd</code> would otherwise leave it Waiting forever. Matters most on Windows, where both probes are unavailable; a session still running self-heals on its next hook.</td>
+                  <td><code>DASHBOARD_CODEX_HOOK_IDLE_SECONDS</code></td>
+                  <td><code>60</code></td>
+                  <td>How long a hook-only Codex session may leave a reported-finished turn unanswered before its <code>SessionEnd</code> is presumed lost. A run started with <code>codex exec --ephemeral</code> writes no rollout, so it has neither a transcript mtime nor an open file for the liveness probes — the fallback that matters most on Windows, where both probes are unavailable. Only a session already parked by a real <code>Stop</code> hook qualifies, because <code>SessionEnd</code> follows <code>Stop</code> within a few hundred milliseconds. Silence never qualifies: a rollout-less run emits no hooks at all while a tool runs, so an idle timer would complete a live CI build. A session still running self-heals on its next hook.</td>
                 </tr>
                 <tr>
                   <td><code>DASHBOARD_TASK_SUMMARY_TTL_MS</code></td>

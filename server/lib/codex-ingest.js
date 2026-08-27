@@ -45,13 +45,22 @@ const LIVE_THREAD_MAX_AGE_MS = 15 * 60 * 1_000;
 // rollout. A rollout that appears later is authoritative, so these rows are
 // removed the moment one is linked to the session (see `dropHookOnlyHistory`).
 const HOOK_EVENT_SOURCE = "hook";
-// How long a rollout-less Codex session may sit silent before the synchronizer
-// assumes its SessionEnd hook was lost. Hooks are fire-and-forget, so a
-// dashboard that was down at exit never hears about it; on Windows neither
-// process probe is available to supply the missing ground truth either.
+// How long a rollout-less Codex session that has ALREADY reported a finished
+// turn may stay silent before the synchronizer concludes its SessionEnd hook
+// was lost. Hooks are fire-and-forget, so a dashboard that was down at exit
+// never hears the terminal one, and such a session has neither a transcript
+// mtime nor an open rollout for the liveness probes (both unavailable on
+// Windows regardless).
+//
+// This gate is deliberately NOT a "how long can a run be quiet" timer — see
+// `reconcileCodexSessionLiveness` for why silence alone proves nothing. It only
+// bounds the wait for a SessionEnd that measurement shows arrives within a few
+// hundred milliseconds of Stop (82 ms / 70 ms / 265 ms across captured
+// codex-cli 0.147.0 runs). The 60 s default matches the existing
+// DASHBOARD_LIVENESS_IDLE_SECONDS gate rather than inventing a second scale.
 const DEFAULT_HOOK_ONLY_IDLE_MS = (() => {
-  const minutes = Number.parseFloat(process.env.DASHBOARD_CODEX_HOOK_IDLE_MINUTES || "");
-  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 10 * 60_000;
+  const seconds = Number.parseFloat(process.env.DASHBOARD_CODEX_HOOK_IDLE_SECONDS || "");
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1_000 : 60_000;
 })();
 
 // Hooks generally identify a Codex thread but do not consistently include its
@@ -1151,7 +1160,7 @@ function reconcileCodexSessionLiveness({
 } = {}) {
   const activeSessions = db
     .prepare(
-      `SELECT id, transcript_path, updated_at, awaiting_input_since,
+      `SELECT id, transcript_path, updated_at, awaiting_input_since, awaiting_reason,
               json_extract(metadata, '$.hook_only') AS hook_only
        FROM sessions WHERE provider = 'codex' AND status = 'active'`
     )
@@ -1162,13 +1171,20 @@ function reconcileCodexSessionLiveness({
     if (!agent) continue;
     const latest = stmts.getLatestCodexLifecycleEvent.get(session.id);
     let didChange = false;
-    // A hook-only session has no rollout whose mtime could prove it is alive,
-    // and on Windows neither process probe is available either. SessionEnd is
-    // fire-and-forget, so when it is lost (dashboard down at exit, CLI killed)
-    // nothing else can retire the card. Silence past the idle window is the
-    // only remaining evidence; a session that is somehow still running
-    // self-heals on its next hook through setCodexWorking's reactivation.
-    if (session.hook_only && !session.transcript_path) {
+    // Retire a hook-only session ONLY on Codex's own evidence that its turn
+    // finished: `awaiting_reason = 'stop'` means a real Stop hook arrived, and
+    // SessionEnd follows Stop within a few hundred ms, so a Stop still
+    // unanswered after the idle window means that SessionEnd was lost.
+    //
+    // Silence is deliberately NOT sufficient. A rollout-less run emits no hooks
+    // at all for the entire duration of a tool call — a captured 12 s sleep
+    // produced a 12,119 ms PreToolUse→PostToolUse gap, and a CI build or test
+    // suite is unbounded — so reaping a quiet session would complete a live run
+    // mid-build. Nor is `interrupted` accepted: that reason is the 90 s
+    // idle-working heuristic's own guess, not something Codex reported, and
+    // promoting a guess to a terminal state is how a long tool call would die.
+    // Those sessions stay put until a real hook resolves them.
+    if (session.hook_only && !session.transcript_path && session.awaiting_reason === "stop") {
       const idleSince = Date.parse(session.updated_at) || 0;
       if (Date.now() - idleSince >= hookOnlyIdleMs) {
         didChange = completeCodexSession(session.id);
