@@ -807,6 +807,57 @@ describe("Codex rollout ingestor", () => {
       assert.equal(rows[0].agent_id, null, "the event is unattributed rather than lost");
     });
 
+    it("refuses to drive a non-Codex session from a hook payload id", () => {
+      // The id is caller-supplied, so it must not reach a session this module
+      // does not own — otherwise a colliding or forged id could complete a
+      // Claude session.
+      const claudeId = "01a04204-6666-7000-8000-666666666666";
+      db.prepare(
+        `INSERT INTO sessions (id, name, status, provider, source, started_at, updated_at)
+         VALUES (?, 'Claude session', 'active', 'claude', 'local', ?, ?)`
+      ).run(claudeId, "2026-08-26T10:00:00.000Z", "2026-08-26T10:00:00.000Z");
+
+      const result = ingestCodexHook(null, "SessionEnd", {
+        session_id: claudeId,
+        transcript_path: null,
+        hook_event_name: "SessionEnd",
+      });
+
+      assert.equal(result.changed, false);
+      assert.equal(
+        stmts.getSession.get(claudeId).status,
+        "active",
+        "a Claude session is never completed by a Codex hook"
+      );
+      assert.equal(
+        db.prepare("SELECT COUNT(*) AS n FROM events WHERE session_id = ?").get(claudeId).n,
+        0
+      );
+    });
+
+    it("restarts the idle clock on every hook, even one that changes no state", () => {
+      // The reconciler measures the window from updated_at, and each write in
+      // the lifecycle path is conditional — a repeated Stop changes nothing.
+      const sessionId = runEphemeralSession("01a040d0-0004-7000-8000-000000000004", {
+        end: false,
+      });
+      const stale = "2020-01-01T00:00:00.000Z";
+      db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(stale, sessionId);
+
+      ingestCodexHook(null, "Stop", {
+        session_id: sessionId,
+        transcript_path: null,
+        hook_event_name: "Stop",
+        last_assistant_message: "DONE",
+      });
+
+      assert.notEqual(
+        stmts.getSession.get(sessionId).updated_at,
+        stale,
+        "a repeated Stop still counts as activity"
+      );
+    });
+
     it("no longer rejects a transcript-less hook at the route", async () => {
       const express = require("express");
       const app = express();

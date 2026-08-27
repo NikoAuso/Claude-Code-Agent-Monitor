@@ -1143,6 +1143,12 @@ function applyCodexHookLifecycle(result, hookType, hookData = null) {
       changed = true;
     }
     changed = setSessionMetadataFlag(sessionId, "hook_only", true) || changed;
+    // The reconciler measures a hook-only session's idle window from
+    // `updated_at`, so that column has to mean "when did a hook last arrive".
+    // Every write above is conditional — a repeated Stop changes no state and a
+    // settled flag writes nothing — which would otherwise freeze the clock at
+    // the first hook of its kind and retire a session that is still reporting.
+    stmts.touchSession.run(sessionId);
   }
 
   return {
@@ -1257,7 +1263,19 @@ function ingestCodexHook(transcriptPath, hookType, hookData) {
   // the terminal SessionEnd — and left the card stuck at Waiting forever.
   const meta = codexHookMeta(hookData);
   if (meta) {
-    const existing = stmts.getSession.get(meta.id);
+    // The id comes from the hook payload, so confirm it names a session this
+    // module actually owns. Without that, a colliding or forged id could drive
+    // Codex lifecycle transitions — including completion — against a Claude or
+    // remote-mirrored session, and attribute events to a `codex:<id>` agent
+    // that was never created. Mirrors the guard in resumeCodexSessionAtPrompt.
+    const candidate = stmts.getSession.get(meta.id);
+    const existing =
+      candidate &&
+      candidate.provider === "codex" &&
+      (candidate.source === null || candidate.source === "local")
+        ? candidate
+        : null;
+    if (candidate && !existing) return result;
     // Only SessionStart may CREATE a session; a later notification for an
     // unknown id would otherwise resurrect a session the user already deleted.
     const session =
