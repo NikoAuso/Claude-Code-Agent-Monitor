@@ -134,15 +134,36 @@ export function isEmptyFilters(f: EventFiltersValue): boolean {
   );
 }
 
-// Status preset → event_type values. Mirrors the status badges shown on event
-// rows (see ActivityFeed/SessionDetail statusFromEventType). "Idle" is handled
-// as everything not covered by the other presets, which translates to an empty
-// preset that doesn't restrict the query (same as no selection).
+// Status preset → event_type values. The exact inverse of `statusFromEventType`
+// in lib/event-grouping, which paints the badge on every event row — keep the
+// two in lock-step or a preset silently stops matching what the user can see.
+// Codex-native types are included, without which the presets never matched a
+// Codex row at all (issue #310). "Idle" is handled as everything not covered by
+// the other presets, which translates to an empty preset that doesn't restrict
+// the query (same as no selection).
 export const STATUS_TO_EVENT_TYPES: Record<string, string[]> = {
-  working: ["PreToolUse"],
-  waiting: ["PostToolUse", "Stop"],
-  completed: ["Stop", "SubagentStop", "Compaction"],
-  error: ["error", "APIError"],
+  working: [
+    "PreToolUse",
+    "UserPromptSubmit",
+    "codex_user_message",
+    "codex_task_started",
+    "codex_tool_call",
+  ],
+  waiting: [
+    "PostToolUse",
+    "codex_exec_command_end",
+    "codex_mcp_tool_call_end",
+    "codex_web_search_end",
+  ],
+  completed: [
+    "Stop",
+    "SessionEnd",
+    "SubagentStop",
+    "Compaction",
+    "codex_task_complete",
+    "codex_context_compacted",
+  ],
+  error: ["error", "APIError", "codex_error"],
 };
 
 export const STATUS_OPTIONS = ["working", "waiting", "completed", "error"] as const;

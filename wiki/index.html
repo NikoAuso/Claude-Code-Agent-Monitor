@@ -1030,8 +1030,10 @@
                     paginated history for scrollback, and auto-scrolling to the latest entry.
                     Click any row to expand its full hook payload inline. A dedicated
                     <strong>Session →</strong> button navigates directly to session detail without
-                    collapsing the expanded state. Every entry is color-coded by event type and
-                    grouped by session for quick scanning of concurrent work.
+                    collapsing the expanded state. Every entry carries the same status badge the Dashboard and Session Detail
+                    show for that event — one shared mapping that understands both Claude and
+                    Codex event types — and rows are grouped by session for quick scanning of
+                    concurrent work.
                   </p>
                 </div>
                 <div class="feature-card">
@@ -7040,7 +7042,7 @@ npm run install-hooks</code></pre>
     <!-- Body-content translations — must load before script.js so the
          i18n engine sees window.__WIKI_CONTENT_I18N. Both are deferred, so they
          run in document order. -->
-    <script src="i18n-content.js?v=85" defer></script>
+    <script src="i18n-content.js?v=86" defer></script>
     <script src="script.js?v=56" defer></script>
     <script>
       (function () {
