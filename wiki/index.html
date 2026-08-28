@@ -1997,6 +1997,11 @@ npm run mcp:start:repl         # interactive CLI with tab completion</code></pre
                   <td>Safety-net interval (ms) for incremental Codex rollout scanning. Default <code>4000</code>; <code>0</code> disables polling but keeps the watcher.</td>
                 </tr>
                 <tr>
+                  <td><code>DASHBOARD_CODEX_HOOK_IDLE_SECONDS</code></td>
+                  <td><code>60</code></td>
+                  <td>How long a hook-only Codex session may leave a reported-finished turn unanswered before its <code>SessionEnd</code> is presumed lost. A run started with <code>codex exec --ephemeral</code> writes no rollout, so it has neither a transcript mtime nor an open file for the liveness probes — the fallback that matters most on Windows, where both probes are unavailable. Only a session already parked by a real <code>Stop</code> hook qualifies, because <code>SessionEnd</code> follows <code>Stop</code> within a few hundred milliseconds. Silence never qualifies: a rollout-less run emits no hooks at all while a tool runs, so an idle timer would complete a live CI build. A session still running self-heals on its next hook.</td>
+                </tr>
+                <tr>
                   <td><code>DASHBOARD_TASK_SUMMARY_TTL_MS</code></td>
                   <td><code>2000</code></td>
                   <td>Serve-stale window (ms) for per-transcript task-progress summaries behind <code>include_task_progress</code> list requests and the session-detail <code>todo_snapshot</code>. A transcript being actively appended to rarely hits the size+mtime cache key, so without this floor every list reload fully re-parses each multi-MB live transcript. <code>0</code> restores immediate re-parse on every change.</td>
@@ -7040,7 +7045,7 @@ npm run install-hooks</code></pre>
     <!-- Body-content translations — must load before script.js so the
          i18n engine sees window.__WIKI_CONTENT_I18N. Both are deferred, so they
          run in document order. -->
-    <script src="i18n-content.js?v=85" defer></script>
+    <script src="i18n-content.js?v=86" defer></script>
     <script src="script.js?v=56" defer></script>
     <script>
       (function () {
