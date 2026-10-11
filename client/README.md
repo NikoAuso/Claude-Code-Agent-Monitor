@@ -63,7 +63,9 @@ The client is a single-page application (SPA) built with modern web technologies
 
 ### First-run hook setup
 
-`SplashScreen.tsx` asks which provider data to display (Claude Code, Codex, or both) before dashboard routes render. Continuing checks the current hook state against that exact scope: Claude-only needs Claude hooks, Codex-only needs Codex hooks, and Both needs both. A ready selection enters the dashboard immediately. A partial or missing setup opens the live-monitoring gate with only the missing selected providers, then calls `POST /api/settings/install-hooks` for that subset and shows command output in place. A status-check failure remains fail-soft by opening manual setup for the full selected scope. API paths are deliberately excluded, so Swagger, ReDoc, and the raw OpenAPI document remain unobstructed and retain the dashboard favicon.
+`SplashScreen.tsx` asks which provider data to display (Claude Code, Codex, or both) before dashboard routes render. The Claude Code choice explicitly includes Cursor monitoring out of the box; the server expands that scope to stored `claude` + `cursor` rows while only Claude hooks need installation. Codex-only needs Codex hooks, and Both needs both hook sets. A ready selection enters the dashboard immediately. A partial or missing setup opens the live-monitoring gate with only the missing selected providers, then calls `POST /api/settings/install-hooks` for that subset and shows command output in place. A status-check failure remains fail-soft by opening manual setup for the full selected scope. API paths are deliberately excluded, so Swagger, ReDoc, and the raw OpenAPI document remain unobstructed and retain the dashboard favicon.
+
+Cursor cards use the native session title plus `Cursor · <project>`, subagent-count, and turn-count subtitles. Session Detail renders Cursor conversations through the same DTO as Claude/Codex and listens for `session_updated` so a newly submitted prompt appears before Cursor emits a tool event or assistant reply. During the prompt-history → transcript hand-off, stable provider message ids merge refresh windows without duplicating the human turn. Settings adds a dedicated Cursor pricing editor (`GET/PUT/DELETE /api/pricing/cursor`) with four published rate columns and plan-billing caveats; its strings ship in all five locales.
 
 Chart legends use the shared `PaginatedLegend.tsx` component. Lists at or below the configured page size render exactly as before with no controls. Longer Analytics donut legends and data-driven Workflows legends render one bounded page at a time with localized Previous / Next buttons and an accessible visible-range announcement, so labels stay reachable without expanding the chart card indefinitely.
 
@@ -199,6 +201,7 @@ client/
 │   │   ├── SplashScreen.tsx   # First-run provider choice and live-hook setup gate
 │   │   ├── PaginatedLegend.tsx # Bounded responsive legends for Analytics and Workflows
 │   │   ├── RemoteSources.tsx  # Remote Data Sources settings panel (SSH multi-machine collection)
+│   │   ├── SnapshotStorage.tsx # Transcript snapshot storage card: per-provider size, compress now, preview-gated prune
 │   │   ├── TodoProgressIndicator.tsx # Micro donut + portal tooltip beside Sessions status
 │   │   ├── TodoProgressPanel.tsx # Full owner-aware tracker on Session Detail
 │   │   ├── todoProgress.ts       # Shared task status colors/formatters
@@ -304,15 +307,19 @@ sequenceDiagram
 
 ## State Management
 
-The client uses **local component state** and **React hooks** for state management. No global state library (Redux, Zustand) is used to keep the architecture simple. The one small exception is the **data-scope store** (`lib/dataScope.ts`): a lightweight app-wide store holding the current source set (`local` plus any configured [Remote Data Sources](../server/README.md#remote-data-sources)) and provider set (`claude`, `codex`, or both). Pages append the resulting `?sources=` and `?providers=` parameters to their API requests, so the Settings selector immediately narrows the whole app to the chosen machines and/or agents. Remote sources are managed from the Settings page via the `RemoteSources` component (`components/RemoteSources.tsx`), which configures independent `~/.claude` and `~/.codex` homes, renders provider-specific connection/sync results, drives the `/api/remote-sources` CRUD/test/sync endpoints, and reflects live `remote_source.status` WebSocket updates. A source can be Claude-only, Codex-only, or both; a healthy provider's data keeps refreshing even if its sibling provider is unavailable. When a sync finishes, stats pages refetch via `lib/remoteDataEvents.ts` (`remote_data.updated`, `remote_source.status` with `ok`, or remote `import.progress` complete).
+The client uses **local component state** and **React hooks** for state management. No global state library (Redux, Zustand) is used to keep the architecture simple. The one small exception is the **data-scope store** (`lib/dataScope.ts`): a lightweight app-wide store holding the current source set (`local` plus any configured [Remote Data Sources](../server/README.md#remote-data-sources)) and product set (`claude`, which includes Claude Code + Cursor, `codex`, or both). Pages append the resulting `?sources=` and `?providers=` parameters to their API requests, so the Settings selector immediately narrows the whole app to the chosen machines and/or agents. Remote sources are managed from the Settings page via the `RemoteSources` component (`components/RemoteSources.tsx`), which configures independent `~/.claude` and `~/.codex` homes, renders provider-specific connection/sync results, drives the `/api/remote-sources` CRUD/test/sync endpoints, and reflects live `remote_source.status` WebSocket updates. A source can be Claude-only, Codex-only, or both; a healthy provider's data keeps refreshing even if its sibling provider is unavailable. Local Cursor discovery uses its Claude-compatible filesystem path and is included by the `claude` product scope. When a sync finishes, stats pages refetch via `lib/remoteDataEvents.ts` (`remote_data.updated`, `remote_source.status` with `ok`, or remote `import.progress` complete).
 
 The Remote Data Sources form names its independent optional overrides **Remote Claude home** and **Remote Codex home**, with `~/.claude` / `~/.codex` defaults and `wsl:~/.claude` / `wsl:~/.codex` placeholders for CLI installs inside WSL.
 
-**Cursor sessions (informational):** Settings surfaces a subtle note on the Claude Code home, Import History, and Remote Data Sources panels — **Cursor** agent sessions count too because Cursor stores transcripts under the same `~/.claude` paths as Claude Code locally (and on synced remotes).
+**Cursor sessions:** Settings explains that the Claude Code dashboard scope also includes native Cursor sessions discovered and snapshotted from `~/.cursor`. Remote Claude-only SSH imports do not mirror remote Cursor homes, so the note calls out that boundary rather than implying those paths are shared.
 
-**Settings data and homes:** the **Dashboard Data** cards select Claude Code, Codex, or both through the same global `dataScope` store used by Remote Data Sources. Every scoped sessions, agents, events, workflow, analytics, token, and cost request re-fetches as soon as the selection changes. The Session Data Locations section independently saves the Claude Code root and the dashboard-specific Codex root; saving the latter asks the server to re-arm its live rollout watcher and scan the new `sessions/` tree immediately. **Import History** uses matching Claude Code / Codex tabs: switching tabs reloads source-specific instructions and paths, then sends the selected provider with rescan, folder, and upload actions while provider-tagged WebSocket progress keeps concurrent work isolated.
+**Settings data and homes:** the **Dashboard Data** cards select Claude-compatible (Claude Code + Cursor), Codex, or both through the same global `dataScope` store used by Remote Data Sources. Every scoped sessions, agents, events, workflow, analytics, token, and cost request re-fetches as soon as the selection changes. The Session Data Locations section independently saves the Claude Code root and the dashboard-specific Codex root; local Cursor discovery follows `~/.cursor` (or `DASHBOARD_CURSOR_HOME`) automatically. Saving the Codex root asks the server to re-arm its live rollout watcher and scan the new `sessions/` tree immediately. **Import History** uses matching Claude Code / Codex tabs: switching tabs reloads source-specific instructions and paths, then sends the selected provider with rescan, folder, and upload actions while provider-tagged WebSocket progress keeps concurrent work isolated; Cursor history is backfilled by its background ingestor without a manual import tab.
 
-**Pricing controls:** the Claude and OpenAI GPT pricing sections use the same title, info-tooltip, **Reset Defaults**, and **Add Model** layout. Each Settings reset button resets only its own provider, while the GPT tooltip holds the USD-per-million-token units, 272K Short/Long threshold, Fast-mode behavior, pattern matching, manual-update guidance, and unpublished-rate handling that would otherwise crowd the table.
+**Transcript snapshots:** the `SnapshotStorage` card (`components/SnapshotStorage.tsx`) reads `snapshots` from `GET /api/settings/info` and shows total and per-provider (Claude Code / Codex / Cursor) snapshot size, the compressed share, and the env-configured retention policy. **Compress now** calls the lossless `POST /api/settings/snapshots/compress`. The prune controls (older than N days, keep total under N GB, include orphans) first run a dry run (`POST /api/settings/snapshots/prune`); **Prune** stays disabled until a preview exists for exactly the criteria on screen, editing any field invalidates it, and applying takes a second confirming click that sends `confirm: "PRUNE_SNAPSHOTS"`. Its strings ship in all five locales.
+
+**Pricing controls:** the Claude, Cursor, and OpenAI GPT pricing sections use the same title, info-tooltip, **Reset Defaults**, and **Add Model** layout. Each Settings reset button resets only its own provider. Cursor keeps input, cache-write, cache-read, and output rates in its own table, while the GPT tooltip holds the USD-per-million-token units, 272K Short/Long threshold, Fast-mode behavior, pattern matching, manual-update guidance, and unpublished-rate handling that would otherwise crowd the table.
+
+**GPT rate groups:** Settings exposes Standard short/long and Fast short/long, each with input, cached input, cache-write, and output prices in USD per million tokens. Both modes use the 272K request boundary. Unpublished tiers remain unpriced. Labels and pricing guidance are translated into all five supported languages. Existing custom rules retain their previous Fast prices in the new long band after upgrade; edits can then set either band independently.
 
 **Provider-aware card context:** Dashboard agent cards and Kanban session cards show compact task context beneath a meaningful provider-native title. Claude Code and Codex both expose up to two recent distinct human prompts as a bounded two-row history: Claude refreshes its small persisted summary from the shared local JSONL cache during live hooks, imports, and watchdog sweeps; Codex accepts legacy user-message events plus modern response-item messages explicitly tagged as human text, excludes injected user-role context, and persists both the preview and distinct turn count. Active Codex sessions consumed by an older cursor are repaired once from their rollout. Every real-time `session_updated` refresh flows through the ordinary scoped data path. Conversation rows render safe persisted raster attachments and quietly hide missing/expired files.
 
@@ -777,16 +784,33 @@ local in-memory Codex startup row appears immediately just as it does on
 Dashboard and Kanban. That row remains non-navigable until the durable session
 ID replaces it; durable totals and later pages stay unchanged.
 
+Provider-owned main cards (Claude Code, Cursor, Codex) title themselves with
+the session's own title — wrapped to at most three lines, with long unbroken
+tokens breaking anywhere and the full title on hover — and lead the subtitle
+with the tool name (`Claude Code · repo · 12 turns`). Without a real title the
+card reads "Untitled session"; the footer keeps only the short session ID
+(subagent cards also keep the session name there as context). Every field that
+stays single-line and truncates in a narrow column — the agent card subtitle
+and footer session name, the session card working directory and model — shows
+its full text on hover.
+
 **Props:**
 ```typescript
 interface AgentCardProps {
   agent: Agent;
+  session?: Session; // model, cwd, cost, title, task progress
+  label?: string; // subtitle override for subagents
+  onClick?: () => void; // default: navigate to the session
+  statusDisplay?: "badge" | "dot"; // "dot" on Kanban, where the column names the status
 }
 ```
 
+`SessionCard` shares the three-line title clamp and the same `statusDisplay`
+prop.
+
 #### StatusBadge
 
-Colored status pills for agents (`AgentStatusBadge`) and sessions (`SessionStatusBadge`). When a row is in the yellow **Waiting** overlay (`awaiting_input_since` set), an optional `reason` prop explains WHY: a hover tooltip carries the full explanation, and — unless `compact` is set — a small nested chip (icon + short label) renders inline. Card layouts (Kanban / Dashboard trees) pass `compact` so the chip never squeezes the card title; the Sessions table and session-detail header show the full chip:
+Colored status pills for agents (`AgentStatusBadge`) and sessions (`SessionStatusBadge`). When a row is in the yellow **Waiting** overlay (`awaiting_input_since` set), an optional `reason` prop explains WHY: a hover tooltip carries the full explanation, and — unless `compact` is set — a small nested chip (icon + short label) renders inline. Card layouts (Kanban / Dashboard trees) pass `compact` so the chip never squeezes the card title; the Sessions table and session-detail header show the full chip. `variant="dot"` renders only the colored status dot — pulse, a tooltip with the status label (plus the waiting reason), and a screen-reader label — for Kanban cards, whose column already names the status:
 
 | `awaiting_reason` | Label | Meaning |
 | ----------------- | ----- | ------- |

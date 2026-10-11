@@ -122,7 +122,21 @@ https://dashboard.example.com
 GET /api/sessions
 ```
 
-Returns all sessions, ordered by most recent activity. Each row may include an optional
+Returns all sessions, ordered by most recent activity. Each list row includes the boolean
+`has_token_usage`: `true` means at least one durable `token_usage` bucket exists, even if every
+counter is zero or the model is unpriced. It does not indicate whether all usage is priced.
+Rows with no buckets, including transient Codex process-overlay rows, report `false`.
+Do not infer coverage from `cost`, which can be zero in either case. This flag is computed
+for the list response; it is not a stored session column or a guaranteed field on detail or
+WebSocket responses.
+
+`repo_remote_url` is optional collector-supplied metadata, not an automatically discovered Git
+remote. The first non-empty sanitized value wins, including when supplied after session creation;
+later hooks or batches cannot replace it. URL/SCP userinfo, query strings, and fragments are
+removed, and malformed URL-style values are discarded before session or hook-event storage.
+For example, `git@example.internal:team/project.git` becomes `example.internal:team/project.git`.
+Consumers may canonicalize the retained value to match a repository across machine-local `cwd`
+paths; it is an identity hint, not a clone credential. Each row may include an optional
 `prompt_preview` for compact cards: the two newest distinct real human prompts, oldest to
 newest and newline-separated. Claude Code persists this bounded summary from the local JSONL
 cache during hooks, imports, and watchdog sweeps; Codex derives it from durable
@@ -164,6 +178,8 @@ curl "http://localhost:4820/api/sessions?limit=10&status=active&include_task_pro
       "model": "claude-sonnet-4",
       "status": "active",
       "cost": 1.23,
+      "has_token_usage": true,
+      "repo_remote_url": "ssh://example.internal:2222/team/project.git",
       "agent_count": 3,
       "started_at": "2024-03-18T12:00:00Z",
       "updated_at": "2024-03-18T14:30:00Z",
@@ -224,7 +240,9 @@ classDiagram
         +string name
         +string status "active|completed|error|abandoned"
         +string cwd
+        +string repo_remote_url "nullable opaque repository identity"
         +string model
+        +boolean has_token_usage "durable token buckets exist"
         +string prompt_preview "nullable card context"
         +string started_at
         +string ended_at
@@ -354,7 +372,11 @@ responses include human turns, legacy `function_call` records, and the primary
 can render the actual command flow rather than only `wait` calls. Both providers
 also expose persisted PNG/JPEG/GIF/WebP user attachments as `image` content blocks;
 missing or expired files are simply omitted, and Codex's duplicated response/event
-user records are returned as one human turn.
+user records are returned as one human turn. Cursor main sessions can return
+`prompt_history.json` turns before JSONL exists. Their messages carry stable `id`
+values; an incremental result with `refresh: true` is a latest window that clients
+merge by `id`, allowing the canonical transcript to replace the pending prompt
+without duplication.
 
 #### Read Persisted Transcript Image
 
@@ -767,11 +789,11 @@ Upsert a pricing rule, keyed by `model_pattern`. The same call creates a new rul
 {
   "model_pattern": "claude-sonnet-5%",
   "display_name": "Claude Sonnet 5",
-  "input_per_mtok": 3,
-  "output_per_mtok": 15,
-  "cache_read_per_mtok": 0.3,
-  "cache_write_per_mtok": 3.75,
-  "cache_write_1h_per_mtok": 6,
+  "input_per_mtok": 2,
+  "output_per_mtok": 10,
+  "cache_read_per_mtok": 0.2,
+  "cache_write_per_mtok": 2.5,
+  "cache_write_1h_per_mtok": 4,
   "fast_input_per_mtok": 0,
   "fast_output_per_mtok": 0,
 
@@ -837,6 +859,31 @@ curl -X PUT http://localhost:4820/api/pricing \
 
 ---
 
+#### Cursor Pricing Rules
+
+```http
+GET    /api/pricing/cursor
+PUT    /api/pricing/cursor
+DELETE /api/pricing/cursor/:pattern
+```
+
+Cursor sessions are priced only against this independent four-column rate card. Each row contains `model_pattern`, `display_name`, `input_per_mtok`, `cache_write_per_mtok`, `cache_read_per_mtok`, and `output_per_mtok`. Rates are USD per million tokens; every supplied rate must be finite and non-negative. Longest/more-specific patterns win, so Cursor Fast entries override their base family. A zero cache-write column represents Cursor's unavailable (`-`) value and is displayed as an em dash in Settings.
+
+```json
+{
+  "model_pattern": "grok-4.6-fast%",
+  "display_name": "Cursor Grok 4.6 (Fast)",
+  "input_per_mtok": 4,
+  "cache_write_per_mtok": 0,
+  "cache_read_per_mtok": 1,
+  "output_per_mtok": 12
+}
+```
+
+`POST /api/settings/reset-pricing` accepts `provider: "cursor"` in addition to `claude` and `codex`. Omitting the body resets all three tables. The response includes `pricing`, `cursor_pricing`, and `gpt_pricing`.
+
+---
+
 #### OpenAI GPT Pricing Rules
 
 ```http
@@ -845,9 +892,18 @@ PUT    /api/pricing/gpt
 DELETE /api/pricing/gpt/:pattern
 ```
 
-These endpoints manage the separate GPT rate card used only for Codex sessions. Each row has four USD-per-million-token rates for each of three groups: `short_*` for standard requests at or below 272K input tokens, `long_*` for larger standard requests, and `fast_*` for Fast mode. The four rates are input, cached input, cache writes, and output. Every present rate must be a finite non-negative number. A published but unavailable tier is stored as an all-zero group and surfaced in cost responses as unpriced, rather than silently guessing a price.
+These endpoints manage the separate GPT rate card used only for Codex sessions. Each row has four USD-per-million-token rates for each of four groups: `short_*` for standard requests at or below 272K input tokens, `long_*` for larger standard requests, `fast_*` for short Fast requests, and `fast_long_*` for Fast requests above 272K. Older API clients that omit `fast_long_*` retain the existing values on update. The four rates are input, cached input, cache writes, and output. Every present rate must be a finite non-negative number. A published but unavailable tier is stored as an all-zero group and surfaced in cost responses as unpriced, rather than silently guessing a price.
 
-`POST /api/settings/reset-pricing` accepts an optional JSON body `{ "provider": "claude" }` or `{ "provider": "codex" }` to reset only that provider's table. Omitting the body preserves the CLI/MCP compatibility behavior and resets both tables. The response returns `provider`, `pricing`, and `gpt_pricing`.
+**Upgrade behavior:** startup corrects only exact obsolete default Astra/Sol rates. When the
+Fast long columns are first added, untouched defaults receive the published Astra and GPT-5.6
+Fast long rates; customized rules inherit their existing Fast rates in the new band. Subsequent
+restarts preserve edits, including an explicit zero rate. Cost estimates are calculated on read,
+so corrected defaults also reprice existing sessions. No token re-import is required. Sol uses
+the currently configured rate for historical estimates too; the dashboard neither fetches live
+prices nor schedules an assumed promotional price increase. Reset Defaults deliberately replaces
+the selected provider's custom prices.
+
+`POST /api/settings/reset-pricing` accepts an optional provider body to reset only one table; see the Cursor section above. Omitting the body preserves compatibility and resets all provider tables.
 
 ```json
 {
@@ -864,7 +920,11 @@ These endpoints manage the separate GPT rate card used only for Codex sessions. 
   "fast_input_per_mtok": 4,
   "fast_cached_input_per_mtok": 0.4,
   "fast_cache_write_per_mtok": 5,
-  "fast_output_per_mtok": 24
+  "fast_output_per_mtok": 24,
+  "fast_long_input_per_mtok": 8,
+  "fast_long_cached_input_per_mtok": 0.8,
+  "fast_long_cache_write_per_mtok": 10,
+  "fast_long_output_per_mtok": 36
 }
 ```
 
@@ -1049,7 +1109,7 @@ POST /api/remote-sources
 | `remote_codex_home` | string | No | Remote Codex home (defaults to remote `~/.codex`) |
 | `enabled` | boolean | No | Whether the source is eligible for syncs (default `true`) |
 
-> **Cursor (informational):** Sessions imported from `~/.claude` include **Cursor** agent usage on that machine too — Cursor happens to use the same paths as Claude Code. CCAM does not tag which app created a session.
+> **Cursor boundary:** Remote SSH sources currently mirror Claude Code and Codex homes only. Local Cursor history is discovered independently from `DASHBOARD_CURSOR_HOME` (default `~/.cursor`); a remote Cursor home must be mounted or otherwise exposed locally before CCAM can ingest it.
 
 Returns `{ "source": RemoteSource }` with HTTP **201**.
 
@@ -1185,6 +1245,7 @@ logs.
   "provider": "claude",
   "session_name": "optional display name (defaults to Session <first 8 chars of id>)",
   "cwd": "optional working directory",
+  "repo_remote_url": "optional opaque Git remote URL",
   "model": "optional model id",
   "tokens": [
     {
@@ -1218,6 +1279,7 @@ logs.
 | `provider` | string | Yes | `claude` or `codex` |
 | `session_name` | string | No | Display name; defaults to `Session <id8>` |
 | `cwd` | string | No | Working directory on the pushing machine |
+| `repo_remote_url` | string | No | Optional collector Git remote; URL/SCP userinfo, query strings, and fragments are removed, malformed URL-style values are discarded, and the first non-empty sanitized value wins |
 | `model` | string | No | Model id for the session |
 | `tokens` | array | No | Each entry is that bucket's **full current total** (like a transcript re-parse), **not** a delta |
 | `tool_events` | array | No | Tool calls, stored as `RemoteToolEvent` events |
@@ -1252,12 +1314,65 @@ persisted.
 | `GET` | `/api/settings/export` | Download a versioned full-dashboard JSON bundle |
 | `POST` | `/api/settings/import` | Restore an export by multipart `file` or JSON `{ "path": "/absolute/file" }`; idempotent and non-destructive |
 | `POST` | `/api/settings/install-hooks` | Install the selected `claude` and/or `codex` hook sets |
-| `POST` | `/api/settings/cleanup` | Abandon stale sessions and/or purge old terminal sessions |
+| `POST` | `/api/settings/cleanup` | Abandon stale sessions and/or purge old terminal sessions; purged sessions' transcript snapshots are deleted too |
+| `GET` | `/api/settings/snapshots` | Transcript snapshot storage per provider and the retention policy |
+| `POST` | `/api/settings/snapshots/compress` | Losslessly compress snapshots whose original transcript is gone |
+| `POST` | `/api/settings/snapshots/prune` | Plan (dry run, default) or apply a snapshot prune |
 | `POST` | `/api/settings/clear-data` | Delete captured sessions, agents, events, token usage, fired alerts, and webhook delivery history |
 | `GET` / `PUT` | `/api/settings/claude-home` | Read or update the Claude Code transcript/configuration root |
 | `GET` / `PUT` | `/api/settings/codex-home` | Read or update the Codex rollout/hooks root; saving re-arms the live watcher and schedules an immediate session scan |
 
 Both home updates accept `{ "path": "/absolute/path" }` (a leading `~/` is expanded). The resolved path must exist and be a directory; invalid input returns `400 INVALID_PATH`. Codex changes are persisted as `DASHBOARD_CODEX_HOME` and notify the background synchronizer after the response so a large history cannot delay the Settings action.
+
+#### Transcript snapshots
+
+Claude Code, Codex, and Cursor delete their own transcripts after a TTL, so the
+dashboard keeps durable copies under its data directory (`transcripts/`,
+`codex-transcripts/`, `cursor-transcripts/`) and the Conversation endpoints serve
+whichever of the live file and the snapshot is more complete.
+
+`GET /api/settings/snapshots` (also embedded in `/api/settings/info` as
+`snapshots`, cached for 5 min):
+
+```json
+{
+  "total_bytes": 734003200,
+  "total_files": 1840,
+  "roots": {
+    "claude": { "path": "/Users/me/.claude/agent-dashboard/transcripts", "files": 1702, "bytes": 692060160, "compressed_files": 1210, "compressed_bytes": 211812352, "sessions": 512 },
+    "codex": { "path": "/Users/me/.claude/agent-dashboard/codex-transcripts", "files": 96, "bytes": 31457280, "compressed_files": 0, "compressed_bytes": 0, "sessions": 96 },
+    "cursor": { "path": "/Users/me/.claude/agent-dashboard/cursor-transcripts", "files": 42, "bytes": 10485760, "compressed_files": 18, "compressed_bytes": 2097152, "sessions": 21 }
+  },
+  "policy": { "compress": true, "max_age_days": null, "max_bytes": null }
+}
+```
+
+`POST /api/settings/snapshots/compress` gzips every Claude/Cursor snapshot whose
+original is gone and that has been idle for 24 h — the same lossless pass the
+server runs every 6 h. Each archive is decompressed and matched (SHA-256 +
+length) before the plain file is removed; a provider whose source tree is
+missing or unreadable is reported in `skipped_roots` and left untouched.
+
+`POST /api/settings/snapshots/prune` takes at least one of `max_age_days`,
+`max_bytes` (bytes or a size such as `"5GB"`), and `orphans: true`. It selects
+whole finished sessions (never `active` ones; the size cap also spares sessions active in the last 24 h), oldest first, and is a **dry
+run** unless the body also has `"dry_run": false` and
+`"confirm": "PRUNE_SNAPSHOTS"`; anything else returns `400
+INVALID_PRUNE_REQUEST`. The response lists up to 500 `candidates` (`kind`,
+`session_id`, `reason`: `max_age` / `max_bytes` / `orphan`, `files`, `bytes`,
+`last_activity`) with `candidate_bytes`, `remaining_bytes`, `over_cap_bytes`, and
+— when applied — `removed_files`, `removed_bytes`, and `failed_files` (locked
+files left for a later pass). Cap removals are tombstoned so a re-import does
+not recreate them.
+
+```bash
+# Preview, then apply, a 5 GB cap
+curl -s -X POST localhost:4820/api/settings/snapshots/prune \
+  -H 'Content-Type: application/json' -d '{"max_bytes":"5GB"}'
+curl -s -X POST localhost:4820/api/settings/snapshots/prune \
+  -H 'Content-Type: application/json' \
+  -d '{"max_bytes":"5GB","dry_run":false,"confirm":"PRUNE_SNAPSHOTS"}'
+```
 
 `POST /api/settings/import` accepts one export file up to 25 MiB. Multipart
 callers use field `file`; CLI/MCP callers may send an absolute server-side

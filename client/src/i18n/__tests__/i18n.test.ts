@@ -181,7 +181,7 @@ describe("i18n resources", () => {
     expect(i18n.t("kanban:session.subagentSummary", { count: 3 })).toBe("3 subagents");
   });
 
-  it("pluralizes the board, session, and run counters in English", async () => {
+  it("pluralizes the board, session, and run counters in English and Spanish", async () => {
     await i18n.changeLanguage("en");
     // These keys previously used the legacy v3 `_plural` suffix, which
     // i18next v21+ never selects — counts of 2+ rendered the singular text.
@@ -192,6 +192,10 @@ describe("i18n resources", () => {
     expect(i18n.t("sessions:sessionCount", { count: 2 })).toBe("2 sessions recorded");
     expect(i18n.t("run:runs.viewActive", { count: 1 })).toBe("1 dashboard run");
     expect(i18n.t("run:runs.viewActive", { count: 2 })).toBe("2 dashboard runs");
+
+    await i18n.changeLanguage("es");
+    expect(i18n.t("kanban:agentCount", { count: 2 })).toBe("2 agentes rastreados");
+    expect(i18n.t("sessions:sessionCount", { count: 2 })).toBe("2 sesiones registradas");
   });
 
   it("pluralizes task-progress counts in English and Spanish", async () => {

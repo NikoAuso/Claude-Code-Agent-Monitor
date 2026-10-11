@@ -21,21 +21,105 @@
  *
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
+/* =============================================================================
+ * MODULE_GUIDE — extended in-file reference (comments only; safe to read, never executed)
+ * =============================================================================
+ * **Path:** `client/src/lib/fuzzy.ts`
+ * **Purpose:** Dashboard module consumed by the React client, MCP tools, or desktop shell depending on deployment mode.
+ *
+ * ## Design constraints
+ * - Local-first: no telemetry leaves the machine unless the user configures webhooks.
+ * - Fail-safe hooks path on the server must never block Claude Code; UI mirrors that
+ *   philosophy by degrading gracefully (empty states, stale badges, reconnect loops).
+ * - Destructive flows stay behind explicit confirmation modals and server-side gates.
+ * - Internationalization: user-visible strings belong in i18n JSON, not literals here.
+ *
+ * ## Remote data & SSH
+ * Remote Data Sources let operators aggregate multiple machines. SSH entries describe
+ * how to reach a peer dashboard; the global data scope (`dataScope.ts`) narrows every
+ * scoped GET via `?sources=`. Health checks and import history surface in Settings.
+ *
+ * ## Observability
+ * Prometheus scrapes `GET /api/metrics` (see `monitoring/`). Grafana ships four
+ * provisioned boards (overview, sessions, tools, alerts). Native npm scripts and
+ * Docker Compose profiles are documented in `monitoring/README.md`.
+ *
+ * ## Public surface
+ * - `FuzzyMatch` — exported API; see TSDoc on the symbol for behavior.
+ * - `foldText` — exported API; see TSDoc on the symbol for behavior.
+ * - `fuzzyMatch` — exported API; see TSDoc on the symbol for behavior.
+ * - `fuzzyMatchFields` — exported API; see TSDoc on the symbol for behavior.
+ * - `highlightSegments` — exported API; see TSDoc on the symbol for behavior.
+ *
+ * ## Testing pointers
+ * - Prefer colocated `__tests__` with Vitest + Testing Library for UI.
+ * - Server contract changes require `npm run test:server` and OpenAPI sync.
+ * - MCP edits: `npm run mcp:typecheck` and `npm run mcp:build`.
+ *
+ * ## Related docs
+ * - `ARCHITECTURE.md` — hooks → API → SQLite → WebSocket → UI pipeline.
+ * - `docs/API.md` — REST reference.
+ * - `.claude/skills/file-headers/` — mandatory `@author` header policy.
+ * ============================================================================= */
+/* -----------------------------------------------------------------------------
+ * EXPORT CATALOG — quick index of symbols defined below (documentation only).
+ * -----------------------------------------------------------------------------
+ * **FuzzyMatch**
+ *   Part of this module's public contract. Downstream imports should treat
+ *   the signature and return type as stable unless release notes say otherwise.
+ *   When behavior changes, update the `@file` overview and relevant tests.
+ *
+ * **foldText**
+ *   Part of this module's public contract. Downstream imports should treat
+ *   the signature and return type as stable unless release notes say otherwise.
+ *   When behavior changes, update the `@file` overview and relevant tests.
+ *
+ * **fuzzyMatch**
+ *   Part of this module's public contract. Downstream imports should treat
+ *   the signature and return type as stable unless release notes say otherwise.
+ *   When behavior changes, update the `@file` overview and relevant tests.
+ *
+ * **fuzzyMatchFields**
+ *   Part of this module's public contract. Downstream imports should treat
+ *   the signature and return type as stable unless release notes say otherwise.
+ *   When behavior changes, update the `@file` overview and relevant tests.
+ *
+ * **highlightSegments**
+ *   Part of this module's public contract. Downstream imports should treat
+ *   the signature and return type as stable unless release notes say otherwise.
+ *   When behavior changes, update the `@file` overview and relevant tests.
+ *
+ * ----------------------------------------------------------------------------- */
 
 /** Result of a successful match. `indices` are positions in the original text. */
 export interface FuzzyMatch {
+  /** Match quality; higher is better. Only comparable between results for the same query. */
   score: number;
+  /** Positions of the matched characters in the original text, for highlighting. */
   indices: number[];
 }
 
+/** Score added when a matched character directly follows the previous match. */
 const BONUS_CONTIGUOUS = 8;
+/**
+ * Score added when a matched character starts a word (follows a space, `-`, `_`, `/`, `.`, or `:`).
+ */
 const BONUS_WORD_START = 12;
+/** Score added when the first query character matches the very first character of the text. */
 const BONUS_FIRST_CHAR = 16;
+/** Score subtracted per skipped character between matches, capped at 10 per gap. */
 const PENALTY_GAP = 1;
+/** Score added when the whole query appears as a contiguous substring. */
 const BONUS_EXACT_SUBSTRING = 40;
+/** Extra score when that contiguous substring is at the very start of the text. */
 const BONUS_PREFIX = 30;
 
-/** Characters after which the next character counts as starting a word. */
+/**
+ * Characters after which the next character counts as starting a word.
+ *
+ * @param char - Preceding character.
+ * @returns True for space, `-`, `_`, `/`, `.`, and `:`.
+ */
 function isSeparator(char: string): boolean {
   return (
     char === " " || char === "-" || char === "_" || char === "/" || char === "." || char === ":"
@@ -44,6 +128,7 @@ function isSeparator(char: string): boolean {
 
 /** Folded text plus, for each folded position, the index it came from. */
 interface FoldedText {
+  /** Text after case folding and diacritic stripping. */
   text: string;
   /** `offsets[i]` is the index in the original string that produced `text[i]`. */
   offsets: number[];
@@ -60,6 +145,9 @@ interface FoldedText {
  * later character shifts right. Highlighting with folded offsets would then
  * underline the wrong characters in exactly the locales this app ships in.
  * Folding per character keeps the mapping exact, at the cost of one pass.
+ *
+ * @param value - Original text.
+ * @returns The folded text with an offset map back to `value`.
  */
 function foldWithOffsets(value: string): FoldedText {
   let text = "";
@@ -80,6 +168,9 @@ function foldWithOffsets(value: string): FoldedText {
 /**
  * Fold case and strip diacritics so `analitica` still matches "Analítica" and a
  * Vietnamese label is reachable from an unaccented keyboard.
+ *
+ * @param value - Text to fold.
+ * @returns Lowercased text without diacritics.
  */
 export function foldText(value: string): string {
   return foldWithOffsets(value).text;
@@ -163,7 +254,13 @@ export function fuzzyMatchFields(
   return null;
 }
 
-/** Split `text` into runs, flagging which are part of the match. */
+/**
+ * Split `text` into runs, flagging which are part of the match.
+ *
+ * @param text - Original text.
+ * @param indices - Positions of matched characters in `text`.
+ * @returns Consecutive runs with a flag marking matched runs.
+ */
 export function highlightSegments(
   text: string,
   indices: number[]

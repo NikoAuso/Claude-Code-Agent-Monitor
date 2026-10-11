@@ -1,6 +1,6 @@
 /**
  * @file Sets up the Express server, API routes, WebSocket, production client,
- * and non-blocking Claude/Codex transcript synchronizers and maintenance jobs.
+ * and non-blocking Claude/Cursor/Codex synchronizers and maintenance jobs.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
 
@@ -313,17 +313,18 @@ function autoImportLegacySessions() {
 }
 
 /**
- * One-time repair of token totals inflated before usage was reconciled per
- * `message.id` (issue #293).
+ * One-time repair of token totals that predate complete transcript accounting:
+ * per-record inflation from issue #293 and omitted same-model subagents from
+ * issue #345.
  *
- * Why this cannot be left to the parser fix alone: `replaceTokenUsage` is a
- * monotonic high-water mark, so when the corrected parser re-reads a transcript
- * and produces a LOWER total, the difference is folded into `baseline_*` and the
- * effective number never drops. Every session that existed before the upgrade
- * would keep its inflated cost forever while new sessions priced correctly.
+ * Why this cannot be left to live fixes alone: `replaceTokenUsage` is a
+ * monotonic high-water mark, so when a corrected parser produces a LOWER total,
+ * the difference is folded into `baseline_*` and the effective number never
+ * drops. A completed session missing subagent usage may also never emit another
+ * hook. Re-reading every stored transcript heals both cases.
  *
  * Guards, in order:
- *   - a `.token-repair-v1.done` marker next to the database, written only after
+ *   - a `.token-repair-v2.done` marker next to the database, written only after
  *     a completed pass, so a crash mid-repair retries instead of being skipped;
  *   - `DASHBOARD_TOKEN_REPAIR=0` opts out entirely;
  *   - skipped (without writing the marker) while another dashboard shares this
@@ -331,7 +332,7 @@ function autoImportLegacySessions() {
  *   - deferred off the boot path so a large corpus never delays the UI.
  *
  * The sweep clears and rewrites non-workflow `token_usage` rows, so it first
- * copies the table to `token_usage_pre_repair` — one snapshot, kept so the
+ * copies the table to `token_usage_pre_repair_v2` — one snapshot, kept so the
  * pre-repair numbers stay recoverable with plain SQL. It is safe to drop.
  *
  * A hook that lands mid-repair can lose one write (the sweep parses outside its
@@ -345,7 +346,7 @@ function repairInflatedTokenTotals() {
     if (process.env.DASHBOARD_TOKEN_REPAIR === "0") return;
 
     const dbModule = require("./db");
-    const markerPath = path.join(path.dirname(dbModule.DB_PATH), ".token-repair-v1.done");
+    const markerPath = path.join(path.dirname(dbModule.DB_PATH), ".token-repair-v2.done");
     if (fs.existsSync(markerPath)) return;
 
     // Another dashboard on the same database would race this sweep. Skip
@@ -365,14 +366,14 @@ function repairInflatedTokenTotals() {
       (async () => {
         try {
           dbModule.db.exec(
-            "CREATE TABLE IF NOT EXISTS token_usage_pre_repair AS SELECT * FROM token_usage"
+            "CREATE TABLE IF NOT EXISTS token_usage_pre_repair_v2 AS SELECT * FROM token_usage"
           );
           const { reconcileTokens } = require("../scripts/import-history");
           const result = await reconcileTokens(dbModule, { all: true, resetBaselines: true });
           if (result.sessionsTouched > 0) {
             console.log(
               `Repaired token totals for ${result.sessionsTouched} session(s) ` +
-                `(issue #293). Pre-repair values kept in token_usage_pre_repair.`
+                `(issues #293 and #345). Pre-repair values kept in token_usage_pre_repair_v2.`
             );
           }
           try {
@@ -406,9 +407,9 @@ function startBackgroundServices() {
   // One-time legacy-session backfill (a no-op once its marker file exists).
   autoImportLegacySessions();
 
-  // One-time repair of token totals inflated by the pre-reconciliation parser
-  // (issue #293). Marker-gated and deferred; see the function for why the
-  // parser fix alone cannot heal historical rows.
+  // One-time repair of historical token totals affected by the old parser or
+  // omitted same-model subagents (issues #293 and #345). Marker-gated and
+  // deferred; see the function for why live fixes cannot heal every old row.
   repairInflatedTokenTotals();
 
   // Boot liveness reap. When the user quit Claude Code while the dashboard
@@ -500,6 +501,24 @@ function startBackgroundServices() {
   } catch (err) {
     console.warn("session sync failed to start:", err.message);
   }
+  // Transcript snapshot retention (issue #358): compresses snapshots whose
+  // original was pruned by Claude Code/Cursor and applies the opt-in
+  // DASHBOARD_SNAPSHOT_MAX_AGE_DAYS / _MAX_BYTES caps. First pass ~2 min after
+  // boot, then every 6 h; unref'd, single-flight, never fatal.
+  try {
+    const { startSnapshotMaintenance } = require("./lib/snapshot-retention");
+    startSnapshotMaintenance(require("./db").db);
+  } catch (err) {
+    console.warn("snapshot maintenance failed to start:", err.message);
+  }
+  // Cursor emits Claude-compatible live hooks, but its durable session history
+  // lives under ~/.cursor. A dedicated importer fills metadata that those hooks
+  // omit and snapshots transcripts before Cursor's own cleanup removes them.
+  try {
+    startCursorSessionSync(broadcast);
+  } catch (err) {
+    console.warn("Cursor session sync failed to start:", err.message);
+  }
   // Codex rollouts are append-only JSONL files under ~/.codex/sessions. Hooks
   // nudge this path immediately; this watcher + short poll closes the gap when
   // a hook is unavailable, untrusted, or fired while the dashboard was down.
@@ -539,6 +558,136 @@ function startBackgroundServices() {
   } catch (err) {
     console.warn("dashboard-runs reconciliation failed:", err.message);
   }
+}
+
+/**
+ * Keep Cursor's native chat and transcript trees in sync. Cursor writes chat
+ * metadata at CLI startup and prompt history on submit, before its transcript
+ * exists; filesystem watchers make those changes visible immediately. A short
+ * poll remains a safety net for missed/coalesced filesystem notifications.
+ */
+function startCursorSessionSync(broadcast, options = {}) {
+  const POLL_MS = process.env.DASHBOARD_CURSOR_SYNC_MS
+    ? Number(process.env.DASHBOARD_CURSOR_SYNC_MS)
+    : 5_000;
+  const fs = require("fs");
+  const path = require("path");
+  const dbModule = options.dbModule || require("./db");
+  const { getCursorChatsDir, getCursorHome, getCursorProjectsDir } = require("./lib/cursor-home");
+  const { syncCursorSessions } = require("./lib/cursor-ingest");
+  let running = false;
+  let queued = false;
+  let closed = false;
+  let debounce = null;
+  let pollTimer = null;
+  let bootTimer = null;
+  const watchers = new Map();
+
+  const tick = () => {
+    if (closed) return Promise.resolve();
+    if (running) {
+      queued = true;
+      return Promise.resolve();
+    }
+    running = true;
+    return syncCursorSessions(dbModule, {
+      onSession(result) {
+        if (!result.session) return;
+        broadcast(result.created ? "session_created" : "session_updated", result.session);
+        for (const agent of dbModule.stmts.listAgentsBySession.all(result.session.id)) {
+          broadcast(result.created ? "agent_created" : "agent_updated", agent);
+        }
+        for (const event of result.events || []) broadcast("new_event", event);
+      },
+    })
+      .catch((err) => console.warn("Cursor session sync tick failed:", err?.message || err))
+      .finally(() => {
+        running = false;
+        if (queued && !closed) {
+          queued = false;
+          tick();
+        }
+      });
+  };
+
+  function scheduleTick() {
+    if (closed || debounce) return;
+    debounce = setTimeout(() => {
+      debounce = null;
+      refreshWatchers();
+      tick();
+    }, 100);
+    if (debounce.unref) debounce.unref();
+  }
+
+  function addWatcher(dir, recursive = false) {
+    if (watchers.has(dir) || !fs.existsSync(dir)) return;
+    try {
+      const watcher = fs.watch(dir, { recursive }, scheduleTick);
+      watcher.on("error", () => {
+        watcher.close();
+        watchers.delete(dir);
+      });
+      if (watcher.unref) watcher.unref();
+      watchers.set(dir, watcher);
+    } catch {
+      // Cursor may rotate a directory between discovery and watch setup. The
+      // home watcher or periodic poll will retry without affecting the server.
+    }
+  }
+
+  function walkDirectories(root, depth) {
+    if (depth < 0 || !fs.existsSync(root)) return;
+    addWatcher(root);
+    if (depth === 0) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) walkDirectories(path.join(root, entry.name), depth - 1);
+    }
+  }
+
+  function refreshWatchers() {
+    if (closed) return;
+    const cursorHome = getCursorHome();
+    const chatsDir = getCursorChatsDir();
+    const projectsDir = getCursorProjectsDir();
+    addWatcher(cursorHome);
+    const recursiveOk = process.platform === "darwin" || process.platform === "win32";
+    if (recursiveOk) {
+      addWatcher(chatsDir, true);
+      addWatcher(projectsDir, true);
+    } else {
+      // Linux does not support recursive fs.watch. Chat depth covers
+      // workspace/session files; project depth covers transcript/subagents.
+      walkDirectories(chatsDir, 2);
+      walkDirectories(projectsDir, 4);
+    }
+  }
+
+  refreshWatchers();
+  bootTimer = setTimeout(tick, options.bootDelayMs ?? 100);
+  if (bootTimer.unref) bootTimer.unref();
+  if (Number.isFinite(POLL_MS) && POLL_MS > 0) {
+    pollTimer = setInterval(tick, POLL_MS);
+    if (pollTimer.unref) pollTimer.unref();
+  }
+
+  return {
+    tick,
+    close() {
+      closed = true;
+      if (bootTimer) clearTimeout(bootTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      if (debounce) clearTimeout(debounce);
+      for (const watcher of watchers.values()) watcher.close();
+      watchers.clear();
+    },
+  };
 }
 
 /**
@@ -1494,6 +1643,7 @@ module.exports = {
   createApp,
   startServer,
   startBackgroundServices,
+  startCursorSessionSync,
   codexHomeChangeTriggersSweep,
   createIngestRetryBudget,
   repairInflatedTokenTotals,

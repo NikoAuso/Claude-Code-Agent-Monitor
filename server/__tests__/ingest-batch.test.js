@@ -196,6 +196,7 @@ describe("POST /api/hooks/ingest-batch", () => {
       provider: "codex",
       session_name: "My roaming laptop session",
       cwd: "/home/bap/work",
+      repo_remote_url: "ssh://collector@example.internal:2222/team/project.git?ref=fixture#readme",
       model: "gpt-5.6",
     });
     assert.equal(res.status, 200);
@@ -207,12 +208,34 @@ describe("POST /api/hooks/ingest-batch", () => {
     assert.equal(session.provider, "codex");
     assert.equal(session.name, "My roaming laptop session");
     assert.equal(session.cwd, "/home/bap/work");
+    assert.equal(session.repo_remote_url, "ssh://example.internal:2222/team/project.git");
     assert.equal(session.model, "gpt-5.6");
     assert.equal(session.status, "active");
 
     const mainAgent = stmts.getAgent.get(`${sessionId}-main`);
     assert.ok(mainAgent, "main agent was created alongside the session");
     assert.equal(mainAgent.session_id, sessionId);
+  });
+
+  it("keeps the first remote-push repository identity across later batches", async () => {
+    const sessionId = newSessionId("repo-identity");
+    const first = await post({
+      session_id: sessionId,
+      provider: "codex",
+      repo_remote_url: "ssh://git@example.internal:2222/team/original.git",
+    });
+    assert.equal(first.status, 200);
+
+    const second = await post({
+      session_id: sessionId,
+      provider: "codex",
+      repo_remote_url: "ssh://git@example.internal:2222/team/retry.git",
+    });
+    assert.equal(second.status, 200);
+    assert.equal(
+      stmts.getSession.get(sessionId).repo_remote_url,
+      "ssh://example.internal:2222/team/original.git"
+    );
   });
 
   it("rejects an oversized batch with 413, before creating a session or doing any DB work", async () => {
@@ -495,6 +518,33 @@ describe("POST /api/hooks/ingest-batch", () => {
     assert.equal(frame.data.created_at, explicitTs, "and both must match the supplied timestamp");
   });
 
+  it("broadcasts remote-push repo identity only after it is persisted", async () => {
+    const ws = new WebSocket(WS_BASE);
+    await new Promise((resolve, reject) => {
+      ws.once("open", resolve);
+      ws.once("error", reject);
+    });
+    const frames = [];
+    ws.on("message", (raw) => frames.push(JSON.parse(raw.toString())));
+
+    const sessionId = newSessionId("ws-repo-identity");
+    const res = await post({
+      session_id: sessionId,
+      provider: "codex",
+      repo_remote_url: "ssh://collector@example.internal:2222/team/live-project.git",
+    });
+    assert.equal(res.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    ws.close();
+
+    const created = frames.find(
+      (frame) => frame.type === "session_created" && frame.data?.id === sessionId
+    );
+    assert.ok(created, "the real WebSocket receives session_created");
+    assert.equal(created.data.repo_remote_url, "ssh://example.internal:2222/team/live-project.git");
+    assert.equal(stmts.getSession.get(sessionId).repo_remote_url, created.data.repo_remote_url);
+  });
+
   it("rejects a malformed timestamp per-item (missing timestamp is fine, invalid one is not)", async () => {
     const sessionId = newSessionId("bad-timestamp");
     const res = await post({
@@ -596,5 +646,129 @@ describe("POST /api/hooks/ingest-batch", () => {
     );
     assert.equal(res.body.errors.length, 0);
     assert.ok(stmts.getAgent.get(`${sessionId}-main`), "the main agent row was recreated");
+  });
+});
+
+describe("POST /api/hooks/event — remote-origin ownership", () => {
+  async function postEvent(data, { token, hookType = "SessionStart" } = {}) {
+    const headers = { "content-type": "application/json" };
+    if (token !== undefined) headers.authorization = `Bearer ${token}`;
+    const response = await fetch(`${BASE}/api/hooks/event`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ hook_type: hookType, data }),
+    });
+    return response.status;
+  }
+
+  function sessionRow(id) {
+    return db.prepare("SELECT source, provider FROM sessions WHERE id = ?").get(id);
+  }
+
+  it("births a remote_push session when the hook proves REMOTE_PUSH_TOKEN, so ingest-batch can enrich it", async () => {
+    const id = newSessionId("remote-hook");
+    assert.equal(await postEvent({ session_id: id, cwd: "/remote/repo" }, { token: TOKEN }), 200);
+    assert.equal(sessionRow(id).source, "remote_push");
+
+    const res = await post({
+      schema_version: 1,
+      session_id: id,
+      provider: "claude",
+      tool_events: [toolEventPayload()],
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.written, 1);
+    assert.deepEqual(res.body.errors || [], []);
+  });
+
+  it("keeps a hook without a token local (unchanged behaviour) and ingest-batch stays refused", async () => {
+    const id = newSessionId("local-hook");
+    assert.equal(await postEvent({ session_id: id, cwd: "/local/repo" }), 200);
+    assert.equal(sessionRow(id).source, "local");
+
+    const res = await post({
+      session_id: id,
+      provider: "claude",
+      tool_events: [toolEventPayload()],
+    });
+    assert.equal(res.body.written, 0);
+    assert.equal(res.body.errors[0].code, "SESSION_LOCALLY_OWNED");
+  });
+
+  it("treats a wrong token as a plain local hook, never a rejection", async () => {
+    const id = newSessionId("wrong-token");
+    assert.equal(await postEvent({ session_id: id }, { token: "not-the-token" }), 200);
+    assert.equal(sessionRow(id).source, "local");
+  });
+
+  it("ignores the token when REMOTE_PUSH_TOKEN is not configured", async () => {
+    delete process.env.REMOTE_PUSH_TOKEN;
+    const id = newSessionId("unconfigured");
+    assert.equal(await postEvent({ session_id: id }, { token: TOKEN }), 200);
+    assert.equal(sessionRow(id).source, "local");
+  });
+
+  it("never relabels an existing local session, even with a valid token", async () => {
+    const id = newSessionId("no-hijack");
+    assert.equal(await postEvent({ session_id: id }), 200);
+    assert.equal(
+      await postEvent({ session_id: id }, { token: TOKEN, hookType: "UserPromptSubmit" }),
+      200
+    );
+    assert.equal(sessionRow(id).source, "local");
+  });
+
+  it("with DASHBOARD_HOOK_TOKEN also set, hookGuard still gates first: both credentials are needed", async () => {
+    const HOOK_TOKEN = "distinct-local-hook-token-abc";
+    process.env.DASHBOARD_HOOK_TOKEN = HOOK_TOKEN;
+    try {
+      async function postRaw(sessionId, headers) {
+        const response = await fetch(`${BASE}/api/hooks/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify({ hook_type: "SessionStart", data: { session_id: sessionId } }),
+        });
+        return response.status;
+      }
+
+      // Remote-push bearer alone: rejected by hookGuard before ownership logic.
+      const onlyRemote = newSessionId("two-token-only-remote");
+      assert.equal(await postRaw(onlyRemote, { authorization: `Bearer ${TOKEN}` }), 401);
+      assert.equal(sessionRow(onlyRemote), undefined);
+
+      // Both credentials in separate headers: accepted and remote_push-owned.
+      const both = newSessionId("two-token-both");
+      assert.equal(
+        await postRaw(both, { "x-ccam-hook-token": HOOK_TOKEN, authorization: `Bearer ${TOKEN}` }),
+        200
+      );
+      assert.equal(sessionRow(both).source, "remote_push");
+
+      // X-Dashboard-Token works in place of the bearer for the remote token.
+      const viaHeader = newSessionId("two-token-x-dashboard");
+      assert.equal(
+        await postRaw(viaHeader, { "x-ccam-hook-token": HOOK_TOKEN, "x-dashboard-token": TOKEN }),
+        200
+      );
+      assert.equal(sessionRow(viaHeader).source, "remote_push");
+
+      // Hook credential alone: accepted as a plain local hook.
+      const onlyHook = newSessionId("two-token-only-hook");
+      assert.equal(await postRaw(onlyHook, { "x-ccam-hook-token": HOOK_TOKEN }), 200);
+      assert.equal(sessionRow(onlyHook).source, "local");
+    } finally {
+      delete process.env.DASHBOARD_HOOK_TOKEN;
+    }
+  });
+
+  it("records a supported non-default provider at birth and ignores an unsupported one", async () => {
+    const codex = newSessionId("remote-codex");
+    assert.equal(await postEvent({ session_id: codex, provider: "codex" }, { token: TOKEN }), 200);
+    assert.deepEqual(sessionRow(codex), { source: "remote_push", provider: "codex" });
+
+    const bogus = newSessionId("remote-bogus");
+    assert.equal(await postEvent({ session_id: bogus, provider: "bogus" }, { token: TOKEN }), 200);
+    assert.equal(sessionRow(bogus).source, "remote_push");
+    assert.notEqual(sessionRow(bogus).provider, "bogus");
   });
 });

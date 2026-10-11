@@ -85,7 +85,32 @@
       "cached": "In cache",
       "write": "Scrittura cache",
       "output": "Output",
-      "deleteConfirm": "Eliminare questa regola di prezzo GPT?"
+      "deleteConfirm": "Eliminare questa regola di prezzo GPT?",
+      "fastLong": "Fast · Long >272K"
+    },
+    "navCursor": "Prezzi Cursor",
+    "cursor": {
+      "title": "Prezzi dei modelli Cursor",
+      "description": "Tariffe pubblicate da Cursor per i modelli nativi di Cursor e per i modelli di terze parti instradati. USD per 1M di token; vince il pattern corrispondente più specifico.",
+      "source": "Vedi modelli e prezzi di Cursor ↗",
+      "planNote": "Le stime usano il listino per-token di Cursor. Pool di utilizzo inclusi, franchigie del piano, routing Auto e fatturazione a tariffa-token dei team possono far differire l'addebito effettivo dell'abbonamento.",
+      "name": "Nome",
+      "input": "Input",
+      "write": "Scrittura cache",
+      "cached": "Lettura cache",
+      "output": "Output",
+      "deleteConfirm": "Eliminare questa regola di prezzo Cursor?",
+      "tooltip": {
+        "title": "Come funzionano i prezzi Cursor",
+        "howItWorks": "Come funziona",
+        "howItWorksBody": "L'uso delle sessioni Cursor è prezzato solo in base al listino Cursor. I token di input, cache-write, cache-read e output sono calcolati in modo indipendente in USD per 1M di token.",
+        "patternsTitle": "Sintassi dei pattern",
+        "patternsBody": "I pattern usano i jolly % in stile SQL. Vincono i pattern più specifici, così un modello Fast o con versione può sovrascrivere in sicurezza una regola di famiglia più ampia.",
+        "manualUpdates": "I prezzi vanno aggiornati manualmente",
+        "manualUpdatesBody": "Cursor pubblica i cambi di prezzo dei modelli sul suo sito; non c'è un feed live. Aggiungi o modifica una regola quando Cursor cambia il nome o la tariffa di un modello.",
+        "apiPricing": "La fatturazione del piano può differire",
+        "apiPricingBody": "Il listino stima il valore dei token. I pool mensili inclusi, l'utilizzo aggiuntivo, il routing Auto e le regole di fatturazione Teams o Enterprise non sono ricostruiti dalla dashboard."
+      }
     }
   },
   "claudeHome": {
@@ -290,7 +315,8 @@
     "runCleanup": "Esegui pulizia",
     "nothingToClean": "Niente da pulire",
     "abandonedResult": " sessioni abbandonate",
-    "purgedResult": " sessioni eliminate ({{events}} eventi, {{agents}} agenti)"
+    "purgedResult": " sessioni eliminate ({{events}} eventi, {{agents}} agenti)",
+    "purgedSnapshots": "Rimossi {{size}} di snapshot delle transcript"
   },
   "danger": {
     "title": "Zona pericolosa",
@@ -316,7 +342,8 @@
     "agents": "agenti",
     "events": "eventi",
     "sessionsWithCost": "sessioni con costo",
-    "pricingRules": "regole di prezzo"
+    "pricingRules": "regole di prezzo",
+    "cursorPricingRules": "Regole di prezzo Cursor"
   },
   "messages": {
     "failedLoad": "Caricamento non riuscito",
@@ -567,5 +594,44 @@
     "removeKeep": "Rimuovi (mantieni i dati)",
     "remoteSourceBadgeTitle": "Raccolta da una macchina remota"
   },
-  "cursorPathsNote": "A titolo informativo: anche le sessioni di Cursor contano qui — Cursor usa gli stessi percorsi ~/.claude di Claude Code (in locale e sulle remote sincronizzate)."
+  "cursorPathsNote": "A titolo informativo: anche le sessioni di Cursor contano qui — Cursor usa gli stessi percorsi ~/.claude di Claude Code (in locale e sulle remote sincronizzate).",
+  "snapshots": {
+    "title": "Snapshot delle transcript",
+    "description": "Copie durevoli che mantengono le conversazioni leggibili dopo che Claude Code, Codex e Cursor eliminano le proprie transcript.",
+    "loading": "Caricamento dello storage degli snapshot...",
+    "total": "Totale",
+    "files_one": "{{formatted}} file",
+    "files_other": "{{formatted}} file",
+    "compressedShare": "{{compressed}} di {{total}} file compressi",
+    "policy": "Compressione: {{compression}} · Limite età: {{age}} · Limite dimensione: {{size}} (impostabili con le variabili d'ambiente DASHBOARD_SNAPSHOT_*)",
+    "on": "attiva",
+    "off": "disattiva",
+    "unlimited": "nessuno",
+    "days_one": "{{count}} giorno",
+    "days_other": "{{count}} giorni",
+    "compressNow": "Comprimi ora",
+    "compressHint": "Senza perdita: comprime solo gli snapshot il cui originale non esiste più, verificati prima di rimuovere la copia non compressa.",
+    "compressNone": "Niente da comprimere. L'originale di ogni snapshot è ancora su disco o è stato attivo di recente.",
+    "compressResult_one": "Compresso {{count}} snapshot ({{before}} → {{after}})",
+    "compressResult_other": "Compressi {{count}} snapshot ({{before}} → {{after}})",
+    "compressFailed_one": "Non è stato possibile comprimere {{count}} snapshot, lasciato invariato.",
+    "compressFailed_other": "Non è stato possibile comprimere {{count}} snapshot, lasciati invariati.",
+    "compressSkipped": "Saltati {{providers}}: cartella di origine mancante o illeggibile, quindi nulla è stato considerato eliminato.",
+    "pruneTitle": "Elimina snapshot vecchi",
+    "pruneDesc": "Rimuove gli snapshot di intere sessioni concluse, dalle più vecchie. Prova prima l'anteprima: uno snapshot eliminato potrebbe essere l'unica copia rimasta di una conversazione.",
+    "olderThan": "Più vecchi di",
+    "keepUnder": "Mantieni il totale sotto",
+    "includeOrphans": "Rimuovi anche gli snapshot di sessioni non più presenti nel database",
+    "preview": "Anteprima",
+    "previewFirst": "Prova prima queste impostazioni",
+    "prune": "Elimina",
+    "confirmPrune": "Conferma eliminazione",
+    "previewNone": "Nessuna corrispondenza. Nessuno snapshot verrebbe rimosso.",
+    "previewResult_one": "{{count}} sessione ({{files}} file, {{size}}) verrebbe rimossa; ne rimarrebbero {{remaining}}.",
+    "previewResult_other": "{{count}} sessioni ({{files}} file, {{size}}) verrebbero rimosse; ne rimarrebbero {{remaining}}.",
+    "overCap": "Ancora {{size}} oltre il limite di dimensione. Le sessioni attive e quelle attive nelle ultime 24 h non vengono mai eliminate.",
+    "pruneWarning": "Questa operazione elimina gli snapshot in modo permanente. Le sessioni il cui originale è già stato eliminato perderanno la conversazione.",
+    "pruneResult_one": "Eliminati gli snapshot di {{count}} sessione ({{size}})",
+    "pruneResult_other": "Eliminati gli snapshot di {{count}} sessioni ({{size}})"
+  }
 }

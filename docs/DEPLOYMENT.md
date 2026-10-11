@@ -95,7 +95,7 @@ docker compose up -d --build
 podman compose up -d --build
 ```
 
-The dashboard is published on `127.0.0.1:4820`. Claude and Codex homes are mounted read-only. SQLite and persisted Settings overrides live in named volumes. The image runs as UID/GID 1000, uses a read-only root filesystem through Compose, drops all Linux capabilities, enables `no-new-privileges`, includes Git/OpenSSH/SQLite CLI, and uses Tini as PID 1.
+The dashboard is published on `127.0.0.1:4820`. Claude, Codex, and Cursor homes are mounted read-only (set host-side `CURSOR_HOME` when Cursor is not at `~/.cursor`). Cursor IDE chat titles come from `state.vscdb` outside that home; to use them in a container, mount Cursor's whole `User/globalStorage` directory read-only (not the single file — the store runs in WAL mode) and point `DASHBOARD_CURSOR_STATE_DB` at `state.vscdb` inside it. SQLite and persisted Settings overrides live in named volumes. The image runs as UID/GID 1000, uses a read-only root filesystem through Compose, drops all Linux capabilities, enables `no-new-privileges`, includes Git/OpenSSH/SQLite CLI, and uses Tini as PID 1.
 
 ### Complete stack
 
@@ -201,7 +201,7 @@ Render and replace the local image name with an immutable registry reference:
 REGISTRY="ghcr.io/$(gh repo view --json owner -q .owner.login)"
 IMAGE_TAG="$(git rev-parse --short HEAD)"
 kubectl kustomize deployments/kubernetes/overlays/production \
-  | sed "s|ccam-dashboard:2.2.0|${REGISTRY}/claude-code-agent-monitor:${IMAGE_TAG}|g" \
+  | sed "s|ccam-dashboard:2.3.0|${REGISTRY}/claude-code-agent-monitor:${IMAGE_TAG}|g" \
   | kubectl apply --server-side --field-manager=ccam-deployer -f -
 ```
 
@@ -300,6 +300,8 @@ The active `.github/workflows/ci.yml`:
 - attaches BuildKit SBOM and SLSA provenance
 - keyless-signs image digests with Cosign and GitHub OIDC
 - publishes releases only after the signed image job succeeds
+- uploads desktop assets individually into a draft, attempts each upload up to three times (one initial attempt and two retries), and verifies asset sizes before publication
+- resumes unfinished drafts only for the same commit; already published versions remain unchanged
 
 All deployment-related actions are pinned by commit SHA.
 

@@ -51,9 +51,8 @@ shell (`<html lang="en">`, `og:locale`) and the app does not reassign
 - [ ] Plural keys use the i18next v4 suffixes `_one` / `_other`. Key parity is
       absolute, so the new locale needs **both** forms for every plural key even
       if the language has no plural inflection — give both the same string, the
-      way `zh`/`vi`/`ko` already do. (The stray `_plural` keys in `kanban.json`
-      and `sessions.json` are legacy and no longer resolved; mirror them for
-      parity, but do not create new ones.)
+      way `zh`/`vi`/`ko` already do. Never use the legacy `_plural` suffix —
+      i18next v4 does not resolve it.
 - [ ] Add `"<xx>"` to **`languageNames` and `languageShort` in every locale's
       `nav.json`** — `en`, `zh`, `vi`, `ko`, `es`, and the new one. This is the
       switcher label; a missing entry renders the raw key in that language.
@@ -113,18 +112,19 @@ for the mechanism and the length/markup constraints.
       A `?v=` mismatch between the two files means the precached asset is never
       served.
 
-## Phase 4 — Mirror the README
+## Phase 4 — Mirror the full English guide
 
-- [ ] Create `README-<XX>.md` as a **complete mirror of `README.md`**: every
+- [ ] Create `README-<XX>.md` as a **complete mirror of `README-EN.md`**: every
       section, every table (same rows, same column count), every code block,
       every mermaid diagram, every badge, in the same order. Nothing summarized,
       nothing dropped.
 - [ ] Keep untranslated: code, commands, paths, URLs, env-var names, CLI flags,
       identifiers, mermaid node IDs, brand and product names, hook event names.
       Translate mermaid **labels**, not node IDs.
-- [ ] Update the localized-docs cross-link line (around line 73–74) in **all**
-      of `README.md`, `README-CN.md`, `README-VN.md`, `README-KO.md`,
+- [ ] Update the full-guide cross-link line in **all**
+      of `README-EN.md`, `README-CN.md`, `README-VN.md`, `README-KO.md`,
       `README-ES.md`, and the new file, so every README links to every other.
+- [ ] Add the new full-guide link to the English-only landing `README.md`.
 - [ ] `server/__tests__/plugins-marketplace.test.js` — add a `COUNTED_DOCS`
       entry for `README-<XX>.md` with regexes matching how the plugin / skill
       counts are phrased in the new language.

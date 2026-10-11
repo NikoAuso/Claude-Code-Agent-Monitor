@@ -44,11 +44,13 @@ Enterprise-grade Node.js backend for Claude Code agent monitoring with real-time
 
 The server is a lightweight Express application that:
 
-1. **Receives hook events** from Claude Code via HTTP POST (stdin → hook-handler.js → server)
+1. **Receives hook events** from Claude Code, compatible Cursor sessions, and Codex via HTTP POST
 2. **Persists data** in SQLite database with schema migrations
 3. **Broadcasts updates** to connected web clients via WebSocket
 4. **Serves REST API** for sessions, agents, events, stats, analytics, pricing, workflows, settings, and docs
-5. **Manages pricing rules** for cost calculation and attribution
+5. **Manages isolated Claude, Cursor, and Codex pricing rules** for cost calculation and attribution
+
+Cursor history is native rather than an alias for Claude storage. `lib/cursor-home.js` resolves `~/.cursor`, while `lib/cursor-ingest.js` discovers chat directories immediately from `meta.json`, applies `prompt_history.json` updates before a transcript exists, records deduplicated `cursor_user_message` activity for Timeline/last-active state, later joins agent transcripts, backfills existing rows (a session whose `meta.json` has no title takes its name from the Cursor IDE's `User/globalStorage/state.vscdb` through the read-only `lib/cursor-state-db.js`, so older `Cursor session <id>` placeholders are repaired on the next sync), imports subagents, and copies durable transcript snapshots into the dashboard data directory. It also moves an idle `working` main agent to `waiting` after `DASHBOARD_WORKING_IDLE_SECONDS`, completes the session after 10 minutes without activity, never revives the agent of an ended session, and heals live-status agents stranded on ended Cursor sessions (on the first sync, then every 5 minutes). `index.js` watches both chat and project trees and broadcasts ordinary session/agent/event frames; `routes/sessions.js` merges pending prompts with Cursor's `role/message.content` JSONL by stable message id for the Conversation tab. `DASHBOARD_CURSOR_HOME` overrides the root; `DASHBOARD_CURSOR_STATE_DB` overrides the `state.vscdb` path; `DASHBOARD_CURSOR_SYNC_MS` controls only the periodic safety scan, not filesystem watching.
 
 ```mermaid
 graph TB
@@ -473,7 +475,7 @@ The OpenAPI spec is generated from `server/openapi.js` (`createOpenApiSpec()`), 
 
 **Prometheus metrics (`GET /api/metrics`).** Exposes the dashboard's live counters — `ccam_sessions`/`ccam_agents` by status, `ccam_events_total`, `ccam_tokens_total` by kind, `ccam_websocket_clients`, `ccam_remote_sources` by enabled state, `ccam_process_uptime_seconds`/`ccam_process_resident_memory_bytes`, and `ccam_build_info{version}` — in the Prometheus v0.0.4 text-exposition format for scraping into Prometheus / Grafana (`server/routes/metrics.js`). Values come from the same `server/db.js` prepared statements the REST API uses, so they match the UI; status series are enumerated so a gauge never drops out of the exposition at zero. The route is read-only and, being under `/api`, sits behind both the Host-header (DNS-rebinding) guard and the optional `DASHBOARD_TOKEN` guard: a non-loopback scraper (e.g. Prometheus in Docker via `host.docker.internal`) must be allowlisted with `DASHBOARD_ALLOWED_HOSTS` or it gets `403 EBADHOST`, and must send the token when one is set. A ready-to-run Prometheus + Grafana stack with four auto-provisioned dashboards (default home **CCAM — Overview**) lives in [`monitoring/`](../monitoring/README.md).
 
-**Data scope (`?sources=` and `?providers=`).** `GET /api/sessions`, `/api/events`, `/api/agents`, `/api/stats`, `/api/analytics`, `/api/workflows`, workflow drill-ins, and pricing cost endpoints accept an optional source list and a provider list (`claude`, `codex`, or both). The filters compose, so a single Settings choice immediately scopes every page by both machine and product. `server/lib/source-filter.js` and `server/lib/provider-filter.js` build the SQL predicates; `/api/stats` and `/api/analytics` use their scoped aggregates only when a filter is present. `GET /api/sessions/facets` returns both `sources` and `providers`.
+**Data scope (`?sources=` and `?providers=`).** `GET /api/sessions`, `/api/events`, `/api/agents`, `/api/stats`, `/api/analytics`, `/api/workflows`, workflow drill-ins, and pricing cost endpoints accept an optional source list and provider list (`claude`, `cursor`, `codex`, or a comma-separated combination). The `claude` product scope intentionally expands to Claude Code + Cursor; direct `cursor` requests remain available for stored-provider drill-ins. The filters compose, so a single Settings choice immediately scopes every page by both machine and product. `server/lib/source-filter.js` and `server/lib/provider-filter.js` build the SQL predicates; `/api/stats` and `/api/analytics` use their scoped aggregates only when a filter is present. `GET /api/sessions/facets` returns both `sources` and `providers`.
 
 **Session project filter (`cwd=`).** `GET /api/sessions` accepts one or more exact working directories. Repeat the query key (`?cwd=/work/a&cwd=/work/b`) to include sessions from any selected project; this OR filter composes with `status`, `q`, `sources`, pagination, and `sort_by` / `sort_desc`. The Sessions page uses it for its searchable checkbox project picker, so multi-project filtering stays server-paginated.
 
@@ -541,6 +543,7 @@ Request body:
   "provider": "claude",
   "session_name": "optional display name (defaults to Session <first 8 chars of id>)",
   "cwd": "optional working directory",
+  "repo_remote_url": "optional opaque Git remote URL",
   "model": "optional model id",
   "tokens": [
     {
@@ -569,6 +572,11 @@ Request body:
 
 `provider` must be one of `claude`/`codex`. `tokens[]` entries are each
 bucket's **full current total** (like a transcript re-parse), not a delta.
+`repo_remote_url` is optional collector-supplied metadata. URL/SCP userinfo, query
+strings, and fragments are removed; malformed URL-style values are discarded.
+The first non-empty sanitized value is retained, even when it arrives after
+session creation. Later batches cannot overwrite it. It is returned on Session
+rows as a cross-machine identity hint; the server does not discover Git remotes.
 `tool_events[]`/`turns[]` are deduped by `(session_id, event_type, uuid)`,
 both against previously-committed rows and within the same batch — safe to
 resend. `tokens.length + tool_events.length + turns.length` is capped at 1000
@@ -576,6 +584,31 @@ per request (`413 BATCH_TOO_LARGE`). A `session_id` already owned by a local
 or SSH-pulled session is refused per-item (`SESSION_LOCALLY_OWNED`) rather
 than allowed to hijack it — a pushed session can only ever create a NEW
 session or append to one it created itself.
+
+**Remote-origin hooks.** A collector that also forwards live hooks from the
+remote machine (so the dashboard gets real-time status, not just batch
+totals) can send the same `REMOTE_PUSH_TOKEN` header on
+`POST /api/hooks/event`. When it matches, a session that event *creates* is
+born `remote_push`-owned — optionally tagged with a supported `data.provider`
+(`claude`/`codex`) — so the collector's later `ingest-batch` calls can enrich
+it. Ownership is still decided once, at row creation, by an authenticated
+source: an existing local session is never relabelled, and a hook without the
+token (or with a wrong one) keeps today's local behaviour.
+
+If `DASHBOARD_HOOK_TOKEN` is also set, `hookGuard` authenticates every
+`/api/hooks/*` request first, so a remote hook needs **both** credentials in
+separate headers:
+
+```http
+X-CCAM-Hook-Token: <DASHBOARD_HOOK_TOKEN>
+Authorization: Bearer <REMOTE_PUSH_TOKEN>
+```
+
+`X-Dashboard-Token: <REMOTE_PUSH_TOKEN>` works in place of the
+`Authorization: Bearer` header — `hookGuard` reads `X-CCAM-Hook-Token` first,
+so the two credentials never collide. Sending only the remote-push token then
+gets `401` from `hookGuard` — the hook-auth boundary is unchanged by
+remote-origin ownership.
 
 Response (`200`, even when individual items were skipped/rejected — see
 `errors[]`/`skipped` for partial-failure detail):
@@ -591,6 +624,9 @@ Response (`200`, even when individual items were skipped/rejected — see
 | `GET`    | `/api/pricing`            | List pricing rules                     |
 | `PUT`    | `/api/pricing`            | Create/update a pricing rule           |
 | `DELETE` | `/api/pricing/:pattern`   | Delete pricing rule                    |
+| `GET`    | `/api/pricing/cursor`     | List the separate Cursor rate card     |
+| `PUT`    | `/api/pricing/cursor`     | Create/update a Cursor rate row        |
+| `DELETE` | `/api/pricing/cursor/:pattern` | Delete a Cursor rate row          |
 | `GET`    | `/api/pricing/gpt`        | List the separate OpenAI GPT rate card |
 | `PUT`    | `/api/pricing/gpt`        | Create/update an OpenAI GPT rate row |
 | `DELETE` | `/api/pricing/gpt/:pattern` | Delete an OpenAI GPT rate row      |
@@ -599,7 +635,7 @@ Response (`200`, even when individual items were skipped/rejected — see
 
 `PUT /api/pricing` also accepts optional **time-limited introductory rates** (`intro_*_per_mtok` + an `intro_until` `YYYY-MM-DD` cutoff): usage on/before the cutoff is priced at the intro rate, after it at the standard rate. Intro columns are written only when the caller sends them, so a standard-rate edit never disturbs a promo. Every rate field present must be a non-negative finite number — `NaN`/negative values are rejected with `400 INVALID_INPUT` before anything is written. The agent-list endpoints (`GET /api/agents`, `GET /api/sessions/:id/agents`) attach a per-agent `cost` — each subagent's OWN cost, computed from its `metadata.tokens` at current rates (0 for main agents, whose cost is the session total).
 
-Codex accounting keeps fresh input, cached input, cache writes, output, and reasoning output separate from rollout cumulative counters. Standard requests at or below 272K input tokens use the short GPT columns; larger standard requests use the long columns; Fast requests use the explicit Fast columns. A model/tier without a configured rate is returned in `unpriced_models` instead of being silently priced as zero.
+Codex accounting keeps fresh input, cached input, cache writes, output, and reasoning output separate from rollout cumulative counters. Standard requests at or below 272K input tokens use the short GPT columns; larger standard requests use the long columns; Fast requests use separate short (`fast_*`) and long (`fast_long_*`) columns at the same 272K boundary. The default GPT rate card includes GPT-6 Astra and the GPT-5.6 family, including current Sol promotional rates. Startup corrects exact obsolete default rates without replacing custom rates. On the first Fast long-column migration, custom rules copy their existing Fast rates into the long band; later restarts preserve edits, including zero rates. Corrections reprice historical estimates on read without re-importing tokens. Sol rates are not automatically fetched or changed at an assumed promotional cutoff. Claude Fast defaults apply only to Opus 5.5, 5 and 4.8; Opus 4.6 falls back to standard rates and Opus 4.7 has no Fast premium. A model/tier without a configured rate is returned in `unpriced_models` instead of being silently priced as zero. Session-list rows expose `has_token_usage` separately from `cost`, so consumers can distinguish no durable token data from a valid zero or unpriced cost; their optional `repo_remote_url` is an opaque collector-observed Git identity for cross-machine project matching.
 
 ### Workflows
 
@@ -612,7 +648,7 @@ Codex accounting keeps fresh input, cached input, cache writes, output, and reas
 
 Live remote/multi-machine data collection over SSH. `server/lib/remote-sync.js` independently mirrors a source's Claude Code tree (`~/.claude/projects`) and Codex tree (`~/.codex/sessions` plus the lightweight native `session_index.jsonl` title index) into isolated staging dirs. Each uses its normal local importer — `importFromDirectory` for Claude and `importCodexFromDirectory` for Codex — then tags imported sessions with `sessions.source`. A source can be Claude-only, Codex-only, or both; either provider can keep the source healthy while provider-specific state preserves correct lifecycle fallback. Authentication defers entirely to the host SSH stack (ssh-agent / `~/.ssh/config` / identity file) — **no secrets are stored**; every command runs via `execFile`/`spawn` argument arrays (never a shell string) and `StrictHostKeyChecking` is left at its SSH default.
 
-> **Cursor on remotes (informational):** The same note applies on synced machines — if Cursor on a remote host writes to `~/.claude`, those sessions are imported too. CCAM reads the paths, not the app name.
+> **Cursor on remotes:** SSH sources currently mirror Claude Code and Codex homes only. Cursor's native `~/.cursor` tree is not pulled by this subsystem; mount or otherwise expose that tree locally and point `DASHBOARD_CURSOR_HOME` at it when remote Cursor history is required.
 
 | Method   | Path                          | Description |
 | -------- | ----------------------------- | ----------- |
@@ -659,10 +695,13 @@ Because sync runs non-interactively (`ssh -o BatchMode=yes`), the connection mus
 | `POST` | `/api/settings/reimport`       | Re-import legacy sessions from `~/.claude/`      |
 | `POST` | `/api/settings/reinstall-hooks`| Reinstall Claude Code hooks                      |
 | `POST` | `/api/settings/install-hooks` | Install selected Claude Code and/or Codex hook sets; preserves unrelated hook entries |
-| `POST` | `/api/settings/reset-pricing`  | Reset Claude, Codex, or both pricing tables to defaults |
-| `GET`  | `/api/settings/export`         | Export all data (sessions, agents, events, token_usage, workflows, dashboard_runs, alert_rules, model_pricing, gpt_model_pricing) as one versioned JSON attachment |
+| `POST` | `/api/settings/reset-pricing`  | Reset Claude, Cursor, Codex, or all pricing tables to defaults |
+| `GET`  | `/api/settings/export`         | Export all data (sessions, agents, events, token_usage, workflows, dashboard_runs, alert_rules, model_pricing, cursor_model_pricing, gpt_model_pricing) as one versioned JSON attachment |
 | `POST` | `/api/settings/import`         | Restore one bundle up to 25 MiB from `/export`. Multipart `file`, or JSON `{ path }` (server reads it). Idempotent + non-destructive: sessions already present are skipped whole |
-| `POST` | `/api/settings/cleanup`        | Abandon stale sessions and purge old data        |
+| `POST` | `/api/settings/cleanup`        | Abandon stale sessions and purge old data; purged sessions' transcript snapshots are deleted too (`purged_snapshot_files` / `purged_snapshot_bytes`) |
+| `GET`  | `/api/settings/snapshots`      | Transcript snapshot storage per provider (`claude` / `codex` / `cursor`: bytes, files, compressed share) + the env retention policy |
+| `POST` | `/api/settings/snapshots/compress` | Losslessly gzip snapshots whose original transcript is gone (verified before the plain copy is removed) |
+| `POST` | `/api/settings/snapshots/prune` | `{ max_age_days?, max_bytes?, orphans? }` — **dry run by default**; deletes only with `dry_run: false` + `confirm: "PRUNE_SNAPSHOTS"` |
 | `GET` / `PUT` | `/api/settings/claude-home` | Read or update the Claude Code transcript/configuration root |
 | `GET` / `PUT` | `/api/settings/codex-home` | Read or update the Codex rollout/hooks root; saving immediately re-arms the watcher and schedules a scan |
 
@@ -763,9 +802,11 @@ rewrites `parent_agent_id`) and runs in `importSession` and the live
 | ------------------------------ | ------------------------------------------------------------------------------------------------------ |
 | `server/routes/import.js`      | Express router, request validation, temp-dir lifecycle, progress broadcasts                            |
 | `server/lib/codex-import.js`   | Historical Codex rollout importer; snapshots external files and delegates parsing/accounting to `codex-ingest.js` |
-| `server/lib/codex-ingest.js`   | Incremental Codex rollout ingestor. Discovery stats each rollout **once** rather than inside the sort comparator, which made newest-first ordering cost O(N log N) stat syscalls. Both read paths close their descriptor in a `finally`, and an I/O failure is reported as `failed` (distinct from a completed no-op) so the sweep keeps that file queued instead of recording its fingerprint and skipping it. The thread id, not the rollout, identifies a session for every lifecycle notification, so a run that persists nothing (`codex exec --ephemeral`) still completes properly; while it has no rollout its hook payloads are stored as events tagged `data.source = "hook"` and the session is marked `hook_only`, both withdrawn if a real rollout is linked later |
+| `server/lib/codex-ingest.js`   | Incremental Codex rollout ingestor. Discovery stats each rollout **once** rather than inside the sort comparator, which made newest-first ordering cost O(N log N) stat syscalls. Transcript, tool-event, and card-context reads use newline-aligned 64 MiB windows, allowing rollouts above V8's roughly 512 MiB string limit to ingest with bounded heap use. File descriptors close in a `finally`, tool events and their cursor advance commit in the same transaction, and an I/O failure is reported as `failed` (distinct from a completed no-op) so the sweep keeps that file queued instead of recording its fingerprint and skipping it. The thread id, not the rollout, identifies a session for every lifecycle notification, so a run that persists nothing (`codex exec --ephemeral`) still completes properly; while it has no rollout its hook payloads are stored as events tagged `data.source = "hook"` and the session is marked `hook_only`, both withdrawn if a real rollout is linked later |
+| `server/lib/snapshot-store.js` | Durable transcript snapshot I/O shared by the Claude, Codex, and Cursor writers: atomic never-shrink copies (copy-on-write where supported), verified gzip compression with an exact-length header, transparent compressed reads, contained deletes, tombstones |
+| `server/lib/snapshot-retention.js` | Snapshot policy: background compression of snapshots whose original is gone, opt-in age/size caps, dry-run prune planning, purge-time deletion |
 | `server/lib/archive.js`        | Safe archive extractors (`.zip` / `.tar(.gz)` / `.gz`) with path-traversal and size-cap enforcement    |
-| `scripts/import-history.js`    | Generalized directory walker (`importFromDirectory`) + shared `parseSessionFile` / `importSession`. Re-import is fully incremental: per-event-type high-water mark (`MAX(created_at) GROUP BY event_type` per session) drives `ts > cutoff[type]` dedup for Stop / PostToolUse / TurnDuration / ToolError, and `sessions.ended_at` is rolled forward when the JSONL has progressed past the stored value. After each batch imports, it calls `ingestWorkflowsForSession` (`server/lib/workflow-ingest.js`) per session — outside the SQLite transaction — so an offline/headless/CI/cluster **Workflow-tool** run (whose journal never reached a live server) has its inner agents linked to their `run_id` on a plain rescan / path import, not left orphaned (`workflow_run_id = NULL`). Both parsers reconcile usage per `message.id` (last record wins), matching `transcript-cache.js`. `reconcileTokens(dbModule, {all, resetBaselines})` backs `npm run repair-tokens` — the one-time repair that re-derives totals for every **Claude** session with a transcript on disk (located under `~/.claude/projects/` or via the session's stored `transcript_path`) and zeroes the `baseline_*` columns, which the ordinary high-water fold would otherwise use to preserve a historical over-count. It clears only non-workflow rows, excludes Codex sessions (their usage comes from rollout journals, not Claude transcripts), and refuses to run while a dashboard is up |
+| `scripts/import-history.js`    | Generalized directory walker (`importFromDirectory`) + shared `parseSessionFile` / `importSession`. Re-import is fully incremental: per-event-type high-water mark (`MAX(created_at) GROUP BY event_type` per session) drives `ts > cutoff[type]` dedup for Stop / PostToolUse / TurnDuration / ToolError, and `sessions.ended_at` is rolled forward when the JSONL has progressed past the stored value. After each batch imports, it calls `ingestWorkflowsForSession` (`server/lib/workflow-ingest.js`) per session — outside the SQLite transaction — so an offline/headless/CI/cluster **Workflow-tool** run (whose journal never reached a live server) has its inner agents linked to their `run_id` on a plain rescan / path import, not left orphaned (`workflow_run_id = NULL`). Both parsers reconcile usage per `message.id` (last record wins), matching `transcript-cache.js`, and combine the main transcript with flat subagent transcripts by model; nested Workflow-tool agents remain separate. `reconcileTokens(dbModule, {all, resetBaselines})` backs `npm run repair-tokens` — the one-time repair that re-derives totals for every **Claude** session with a transcript on disk (located under `~/.claude/projects/` or via the session's stored `transcript_path`) and zeroes the `baseline_*` columns, which the ordinary high-water fold would otherwise use to preserve an incorrect historical total. It clears only non-workflow rows, excludes Codex sessions (their usage comes from rollout journals, not Claude transcripts), and refuses to run while a dashboard is up |
 | `server/lib/transcript-cache.js` | Chunked 4 MiB sync byte-stream reader for JSONL transcripts — never materializes the whole file as a JS string, so files larger than V8's max string length (~512 MiB on 64-bit Node 20) parse without aborting Node with `FATAL ERROR: v8::ToLocalChecked Empty MaybeLocal`. Token usage is **reconciled per `message.id`** (last record wins), not summed per record: Claude Code writes one record per content block and each copies the message's `usage`, so the old per-record sum inflated totals 2–4× (issue #293) |
 
 **Request flow (upload)**
@@ -813,7 +854,7 @@ matches one probed from either layout candidate.
 | Variable                          | Default     | Purpose                                                           |
 | --------------------------------- | ----------- | ----------------------------------------------------------------- |
 | `CCAM_IMPORT_MAX_BYTES`           | `1073741824` | Maximum size per uploaded file                                   |
-| `DASHBOARD_TOKEN_REPAIR`          | `1`         | One-time automatic repair of token totals inflated before usage was reconciled per `message.id`; `0` skips it (repair manually with `npm run repair-tokens`) |
+| `DASHBOARD_TOKEN_REPAIR`          | `1`         | One-time automatic repair of historical token totals affected by per-record inflation or omitted same-model flat subagents; `0` skips it (repair manually with `npm run repair-tokens`) |
 | `CCAM_IMPORT_MAX_FILES`           | `2000`      | Maximum files per upload request                                 |
 | `CCAM_IMPORT_MAX_EXTRACT_BYTES`   | `4294967296` | Total uncompressed bytes allowed per archive (zip-bomb guard)   |
 
@@ -1264,6 +1305,17 @@ The startup auto-import of `~/.claude/projects` is **one-time** (marker-gated vi
 
 Each sweep parses **only** files whose mtime is new or has advanced. A cold-cache fast path (e.g. the immediate sweep on every restart, when `mtimeCache` is empty) additionally skips an already-imported session whose file mtime hasn't advanced past its DB row's `updated_at`, so restart cost stays O(new/changed files) instead of re-parsing every transcript on disk. For each touched session it then broadcasts `session_created` / `session_updated` plus the session's main agent (`agent_created` / `agent_updated`) — the same frames hooks emit, so the UI refreshes live. All timers and watchers are `unref`'d and best-effort; nothing here can block shutdown or take down the server.
 
+### Transcript Snapshot Retention
+
+Claude Code, Codex, and Cursor delete their own transcripts after a TTL, so imports snapshot them into `<dataDir>/transcripts`, `codex-transcripts`, and `cursor-transcripts`. `lib/snapshot-retention.js` bounds that growth without deleting the only copy of a transcript for a session that still exists — except through the opt-in caps or a confirmed prune in step 4, which remove whole old sessions even when the original has expired (issue #358):
+
+1. **Writes never shrink.** `lib/snapshot-store.js#writeSnapshot` replaces a snapshot only with a longer source (or a same-length newer rewrite) via temp file + rename, so a truncated original can't clobber the fuller copy. Reads (`routes/sessions.js`, `lib/task-progress.js`) serve whichever of live and snapshot is longer.
+2. **Lossless compression** — on by default, `DASHBOARD_SNAPSHOT_COMPRESS=0` disables it. Every 6 h (first pass ~2 min after boot), Claude/Cursor snapshots whose original is gone and that have been idle 24 h become `.jsonl.gz` after a decompress + SHA-256 + length check. A provider whose source tree is missing or unreadable is skipped. Codex snapshots stay plain (byte-offset ingest source). `POST /api/settings/snapshots/compress` runs the pass on demand.
+3. **Purges take their snapshots.** `POST /api/settings/cleanup` (`purge_days`) and `DELETE /api/remote-sources/:id?purge=true` delete the purged sessions' snapshot files in all three roots.
+4. **Opt-in caps.** `DASHBOARD_SNAPSHOT_MAX_AGE_DAYS` / `DASHBOARD_SNAPSHOT_MAX_BYTES` (unset by default) prune whole finished sessions oldest-first on the same 6 h schedule (the size cap spares sessions active in the last 24 h) and tombstone them (`<root>/.pruned/<id>`) so re-imports don't regrow them; a session that resumes is snapshotted again. Preview any prune with `POST /api/settings/snapshots/prune` (dry run by default) or `ccam snapshots prune`.
+
+The store is pure Node (no shell-outs or native add-ons) and retries Windows file-lock errors; `npm run test:snapshots` runs on Linux, macOS, and Windows in CI.
+
 ### Codex Sweep Triggers
 
 The codex-home watcher deliberately does **not** treat the SQLite `-shm` sidecar as a reason to sweep.
@@ -1332,7 +1384,7 @@ Live user actions and the transcript-tail check clear the error; unrelated backg
 
 ### Graceful Shutdown
 
-`SIGTERM` / `SIGINT` tear the server down in a fixed order so a restart is fast and clean. In development, `scripts/dev-server.js` watches runtime server/script sources, coalesces a burst of saves for 500 ms, and sends one SIGTERM before waiting for this shutdown sequence to finish. Its child inherits stdio directly, avoiding the built-in `node --watch` output proxy's fatal `EPIPE` during repeated restarts:
+`SIGTERM` / `SIGINT` tear the server down in a fixed order so a restart is fast and clean. In development, `scripts/dev-server.js` watches runtime server/script sources, coalesces a burst of saves for 500 ms, and sends one SIGTERM before waiting for this shutdown sequence to finish. Its child inherits stdio directly, avoiding the built-in `node --watch` output proxy's fatal `EPIPE` during repeated restarts. The WSL remote-history transport also owns error handlers on both sides of its `ssh.stdout → tar.stdin` pipe: if reload closes `tar` while SSH still has buffered archive bytes, that source sync reports a contained stream failure instead of an uncaught `write EPIPE` terminating the dashboard.
 
 1. **Drop realtime clients first** — `closeWebSocket()` (`server/websocket.js`) terminates every WebSocket client so their underlying TCP sockets release. Open WS sockets otherwise keep the HTTP server alive.
 2. **`httpServer.close()`** — stop accepting new connections and begin draining in-flight requests.
@@ -1504,7 +1556,7 @@ test("POST /api/hooks/event ingests hook payload", async () => {
 
 ## Terminal Access (`ccam` CLI)
 
-Everything this server exposes over JSON REST is reachable from the dependency-free `ccam` CLI (`bin/ccam.js`, linked by `npm run setup`). High-level commands cover monitoring, data browsing, workflows/cost, Run Agent, alerts/rules/webhooks, Claude and GPT pricing, provider-aware imports, remote sources, Claude/Codex config, hooks, backup restore, and administration. `ccam api <METHOD> /api/path` provides future-proof low-level coverage with `--yes` on writes and exact confirmation tokens for destructive actions. Multipart history upload is available through `ccam import upload`. It resolves the live server through the same `~/.claude/.agent-dashboard.json` registry as the hook handler and supports `DASHBOARD_API_TOKEN` / `CCAM_API_TOKEN` when the API is protected. See [docs/CLI.md](../docs/CLI.md).
+Everything this server exposes over JSON REST is reachable from the `ccam` CLI (`bin/ccam.js` → `cli/`, a Commander.js command tree linked by `npm run setup`). High-level commands cover monitoring (including a live `overview` and the `/ws` feed via `ccam stream`), sessions/agents/events with detail and writes, transcripts, workflows/cost, Run Agent, alerts/rules/webhooks, Claude, Cursor, and GPT pricing, provider-aware imports, remote sources, Claude/Codex config, hooks, backup restore, and administration. `ccam api <METHOD> /api/path` provides future-proof low-level coverage with `--yes` on writes and exact confirmation tokens for destructive actions. Multipart history upload is available through `ccam import upload`. It resolves the live server through the same `~/.claude/.agent-dashboard.json` registry as the hook handler and supports `DASHBOARD_API_TOKEN` / `CCAM_API_TOKEN` when the API is protected. Every command accepts `--json` for machine-readable output. See [docs/CLI.md](../docs/CLI.md).
 
 ## Deployment
 
@@ -1564,12 +1616,18 @@ DASHBOARD_DB_PATH=./data/dashboard.db  # SQLite database path
 
 # Background services
 DASHBOARD_SESSION_SYNC_MS=30000    # Continuous project-sync poll interval (ms); 0 disables the poll (watcher stays)
+DASHBOARD_CURSOR_HOME=             # Optional Cursor home; defaults to ~/.cursor for native history and chat metadata
+DASHBOARD_CURSOR_STATE_DB=         # Optional Cursor IDE state.vscdb (read-only, chat titles); defaults to the per-platform User/globalStorage path
+DASHBOARD_CURSOR_SYNC_MS=5000      # Cursor chat/transcript safety-net poll (ms); 0 keeps watchers but disables polling
 DASHBOARD_CODEX_HOME=              # Optional Codex home; Settings saves this dashboard-only override and immediately re-arms live watching
 DASHBOARD_CODEX_SYNC_MS=4000       # Codex rollout safety-net poll (ms); 0 disables poll (watcher stays)
 DASHBOARD_CODEX_MAX_ATTEMPTS=5     # Consecutive failed ingest attempts per unchanged rollout, including the first attempt
 DASHBOARD_CODEX_HOOK_IDLE_SECONDS=60 # Wait for a lost SessionEnd on a hook-only (rollout-less) Codex session
 DASHBOARD_TASK_SUMMARY_TTL_MS=2000 # Serve-stale window (ms) for task-progress summaries of actively-growing transcripts; 0 re-parses on every change
-DASHBOARD_TOKEN_REPAIR=1           # One-time startup repair of pre-reconciliation token totals; 0 skips it
+DASHBOARD_SNAPSHOT_COMPRESS=1      # 0 stops lossless compression of transcript snapshots whose original is gone
+DASHBOARD_SNAPSHOT_MAX_AGE_DAYS=   # Opt-in: prune snapshots of finished sessions idle > N days (unset = unlimited)
+DASHBOARD_SNAPSHOT_MAX_BYTES=      # Opt-in: prune oldest finished sessions' snapshots until under this size, e.g. 5GB (unset = unlimited)
+DASHBOARD_TOKEN_REPAIR=1           # One-time repair of inflated or subagent-incomplete token totals; 0 skips it
 DASHBOARD_LIVENESS_PROBE=1         # 0 disables the local Claude Code/Codex dead-session liveness reap (use when hooks arrive from another machine)
 DASHBOARD_LIVENESS_IDLE_SECONDS=60 # Idle gate before the liveness reap may complete a process-less session
 

@@ -258,10 +258,13 @@ vi.mock("../../lib/api", async (importOriginal) => {
       },
       pricing: {
         list: r({ pricing: [] }),
+        listCursor: r({ pricing: [] }),
         listGpt: r({ pricing: [] }),
         upsert: r({ pricing: {} }),
+        upsertCursor: r({ pricing: {} }),
         upsertGpt: r({ pricing: {} }),
         delete: r({ ok: true }),
+        deleteCursor: r({ ok: true }),
         deleteGpt: r({ ok: true }),
         totalCost: r(cost),
         sessionCost: r(cost),
@@ -279,7 +282,13 @@ vi.mock("../../lib/api", async (importOriginal) => {
         clearData: r({ ok: true, cleared: {} }),
         reimport: r({ ok: true, imported: 0, skipped: 0, errors: 0 }),
         reinstallHooks: r({ ok: true, hooks: { installed: true, hooks: {} } }),
-        resetPricing: r({ ok: true, provider: "both", pricing: [], gpt_pricing: [] }),
+        resetPricing: r({
+          ok: true,
+          provider: "both",
+          pricing: [],
+          cursor_pricing: [],
+          gpt_pricing: [],
+        }),
         exportData: () => "/api/settings/export",
         cleanup: r({
           ok: true,
@@ -652,6 +661,14 @@ describe("screen snapshots", () => {
     const gptAdd = gpt.getByRole("button", { name: "Add Model" });
     const subtitle = gpt.getByText(/Published OpenAI API rates.*USD per 1M tokens\./);
 
+    expect(gpt.getByRole("columnheader", { name: "Fast · Short ≤272K" })).toHaveAttribute(
+      "colspan",
+      "4"
+    );
+    expect(gpt.getByRole("columnheader", { name: "Fast · Long >272K" })).toHaveAttribute(
+      "colspan",
+      "4"
+    );
     expect(gptReset.className).toBe(claudeReset.className);
     expect(gptAdd.className).toBe(claudeAdd.className);
     expect(

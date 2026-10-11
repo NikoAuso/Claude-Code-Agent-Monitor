@@ -1,6 +1,6 @@
 /**
  * @file Database setup and access layer using SQLite for sessions, agents,
- * events, token usage, and model pricing. Handles schema/migrations and
+ * events, token usage, and Claude, Cursor, and Codex model pricing. Handles schema/migrations and
  * exposes prepared statements, including card-ready task/prompt previews.
  * @author Son Nguyen <hoangson091104@gmail.com>
  */
@@ -285,6 +285,19 @@ db.exec(`
     fast_cached_input_per_mtok REAL NOT NULL DEFAULT 0,
     fast_cache_write_per_mtok REAL NOT NULL DEFAULT 0,
     fast_output_per_mtok REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );
+
+  -- Cursor publishes its own four-column rate card. Keep it separate from
+  -- Claude and Codex because Cursor-native and routed third-party models can
+  -- have Cursor-specific prices (including distinct Fast model identifiers).
+  CREATE TABLE IF NOT EXISTS cursor_model_pricing (
+    model_pattern TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    input_per_mtok REAL NOT NULL DEFAULT 0,
+    cache_write_per_mtok REAL NOT NULL DEFAULT 0,
+    cache_read_per_mtok REAL NOT NULL DEFAULT 0,
+    output_per_mtok REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   );
 
@@ -604,8 +617,6 @@ try {
     "UPDATE model_pricing SET fast_input_per_mtok = ?, fast_output_per_mtok = ? WHERE model_pattern = ? AND fast_input_per_mtok = 0"
   );
   setFast.run(10, 50, "claude-opus-4-8%");
-  setFast.run(30, 150, "claude-opus-4-7%");
-  setFast.run(30, 150, "claude-opus-4-6%");
 }
 
 // Migrate: add time-limited introductory-rate columns to model_pricing.
@@ -628,7 +639,8 @@ try {
   db.prepare("ALTER TABLE model_pricing ADD COLUMN intro_until TEXT").run();
 }
 
-// Default model pricing — shared by initial seed + startup top-up + reset endpoint
+// Standard rates verified against https://platform.claude.com/docs/en/about-claude/pricing
+// on 2026-09-15. Default model pricing is shared by startup and reset.
 // Columns: pattern, display_name, input, output, cache_read (hits & refreshes),
 //          cache_write (5m ephemeral writes), cache_write_1h (1h ephemeral writes),
 //          fast_input, fast_output (fast-mode premium; 0 = model has no fast pricing)
@@ -645,18 +657,24 @@ const DEFAULT_PRICING = [
   ["claude-mythos-5-1%", "Claude Mythos 5.1", 10, 50, 0.25, 12.5, 20, 0, 0],
   ["claude-fable-5%", "Claude Fable 5", 10, 50, 1, 12.5, 20, 0, 0],
   ["claude-mythos-5%", "Claude Mythos 5", 10, 50, 1, 12.5, 20, 0, 0],
-  // Opus family (fast mode available on 4.6 / 4.7 / 4.8, and now 5)
+  // Opus family (Fast mode is available only on Opus 5.5, 5 and 4.8).
+  // claude-opus-5-5: $4/$20 input/output, $0.20 cache read (0.05x input, not the
+  // standard 0.1x), $5 5m cache write, $8 1h cache write; Fast mode $8/$40. It
+  // needs its own pattern: `claude-opus-5%` also LIKE-matches "claude-opus-5-5",
+  // and the longest-pattern-first ordering (see the Fable/Mythos 5.1 note above)
+  // lets this rule win.
+  ["claude-opus-5-5%", "Claude Opus 5.5", 4, 20, 0.2, 5, 8, 8, 40],
   // claude-opus-5: $5/$25 input/output, $0.50 cache read, $6.25 5m cache write,
   // $10 1h cache write — matching Anthropic's published rate card and identical
   // to the 4.8/4.7/4.6/4.5 rows that share the same $5 input tier. Fast mode is
-  // $10/$50 (fast mode is Opus 5 / Opus 4.8 only).
+  // $10/$50.
   // `%` covers both "claude-opus-5" and "claude-opus-5[1m]" (observed model
   // string with the 1M-context flag) under one rule — the same convention every
   // other model here uses, not a separate pricing tier.
   ["claude-opus-5%", "Claude Opus 5", 5, 25, 0.5, 6.25, 10, 10, 50],
   ["claude-opus-4-8%", "Claude Opus 4.8", 5, 25, 0.5, 6.25, 10, 10, 50],
-  ["claude-opus-4-7%", "Claude Opus 4.7", 5, 25, 0.5, 6.25, 10, 30, 150],
-  ["claude-opus-4-6%", "Claude Opus 4.6", 5, 25, 0.5, 6.25, 10, 30, 150],
+  ["claude-opus-4-7%", "Claude Opus 4.7", 5, 25, 0.5, 6.25, 10, 0, 0],
+  ["claude-opus-4-6%", "Claude Opus 4.6", 5, 25, 0.5, 6.25, 10, 0, 0],
   ["claude-opus-4-5%", "Claude Opus 4.5", 5, 25, 0.5, 6.25, 10, 0, 0],
   ["claude-opus-4-1%", "Claude Opus 4.1", 15, 75, 1.5, 18.75, 30, 0, 0],
   ["claude-opus-4-2%", "Claude Opus 4", 15, 75, 1.5, 18.75, 30, 0, 0],
@@ -666,6 +684,12 @@ const DEFAULT_PRICING = [
   // numbers; once it lapsed, usage fell back to the old $3/$15 standard and
   // over-reported by 50%. The promo row is now a no-op and is kept only so
   // existing DBs that already stamped intro_until keep their history.
+  // claude-sonnet-5-5: $2/$10 input/output, $0.20 cache read, $2.50 5m cache
+  // write, $4 1h cache write; no Fast mode. Same numbers as Sonnet 5 today, but
+  // it gets its own row: `claude-sonnet-5%` also LIKE-matches
+  // "claude-sonnet-5-5", so without one Sonnet 5.5 usage is labelled as Sonnet 5
+  // and silently follows every Sonnet 5 edit, intro stamp and rate correction.
+  ["claude-sonnet-5-5%", "Claude Sonnet 5.5", 2, 10, 0.2, 2.5, 4, 0, 0],
   ["claude-sonnet-5%", "Claude Sonnet 5", 2, 10, 0.2, 2.5, 4, 0, 0],
   ["claude-sonnet-4-6%", "Claude Sonnet 4.6", 3, 15, 0.3, 3.75, 6, 0, 0],
   ["claude-sonnet-4-5%", "Claude Sonnet 4.5", 3, 15, 0.3, 3.75, 6, 0, 0],
@@ -680,6 +704,9 @@ const DEFAULT_PRICING = [
   ["claude-3-opus%", "Claude Opus 3", 15, 75, 1.5, 18.75, 30, 0, 0],
 ];
 
+// OpenAI rates: https://developers.openai.com/api/docs/pricing (2026-09-15;
+// GPT-6 Sol and Luna added 2026-09-29).
+// GPT-5.6 Sol uses the currently published promotional rates; do not guess a future cutoff.
 // OpenAI pricing supplied for Codex support. Only models for which the supplied
 // rate card publishes a long-context column receive long rates; unsupported
 // combinations remain zero and surface as explicitly unpriced rather than
@@ -692,7 +719,19 @@ const gptRate = (pattern, name, short, fast = [0, 0, 0, 0], long = [0, 0, 0, 0])
   ...fast,
 ];
 const DEFAULT_GPT_PRICING = [
-  gptRate("gpt-5.6-sol%", "GPT-5.6 Sol", [5, 0.5, 6.25, 30], [10, 1, 12.5, 60], [10, 1, 12.5, 45]),
+  // GPT-6 Astra has a distinct API rate card. Keep it ahead of the broader
+  // gpt-5 patterns so Codex rollout records are priced rather than reported
+  // as unpriced usage.
+  gptRate("gpt-6-astra%", "GPT-6 Astra", [10, 1, 12.5, 50], [20, 2, 25, 100], [20, 2, 25, 75]),
+  gptRate("gpt-6-sol%", "GPT-6 Sol", [2, 0.2, 2.5, 10], [4, 0.4, 5, 20], [4, 0.4, 5, 15]),
+  gptRate(
+    "gpt-6-luna%",
+    "GPT-6 Luna",
+    [0.1, 0.01, 0.125, 0.5],
+    [0.2, 0.02, 0.25, 1],
+    [0.2, 0.02, 0.25, 0.75]
+  ),
+  gptRate("gpt-5.6-sol%", "GPT-5.6 Sol", [4, 0.4, 5, 20], [8, 0.8, 10, 40], [8, 0.8, 10, 30]),
   gptRate("gpt-5.6-terra%", "GPT-5.6 Terra", [2, 0.2, 2.5, 12], [4, 0.4, 5, 24], [4, 0.4, 5, 18]),
   gptRate(
     "gpt-5.6-luna%",
@@ -736,6 +775,112 @@ const DEFAULT_GPT_PRICING = [
   gptRate("babbage-002%", "Babbage-002", [0.4, 0, 0, 0.4]),
 ];
 
+// Cursor model rates: https://cursor.com/docs/models-and-pricing (2026-09-19).
+// Columns are pattern, label, input, cache write, cache read, and output,
+// all in USD per million tokens. A zero cache-write rate means Cursor marks
+// that category unavailable rather than free; it is still shown as "—" in UI.
+const cursorRate = (pattern, name, input, cacheWrite, cacheRead, output) => [
+  pattern,
+  name,
+  input,
+  cacheWrite,
+  cacheRead,
+  output,
+];
+const DEFAULT_CURSOR_PRICING = [
+  cursorRate("grok-4.6-fast%", "Cursor Grok 4.6 (Fast)", 4, 0, 1, 12),
+  cursorRate("grok-4.6%", "Cursor Grok 4.6", 2, 0, 0.5, 6),
+  cursorRate("grok-4.5-fast%", "Cursor Grok 4.5 (Fast)", 4, 0, 1, 18),
+  cursorRate("grok-4.5%", "Cursor Grok 4.5", 2, 0, 0.5, 6),
+  cursorRate("composer-2.5-fast%", "Cursor Composer 2.5 (Fast)", 3, 0, 0.5, 15),
+  cursorRate("composer-2.5%", "Cursor Composer 2.5", 0.5, 0, 0.2, 2.5),
+  cursorRate("claude-4-sonnet-1m%", "Claude 4 Sonnet 1M", 6, 7.5, 0.6, 22.5),
+  cursorRate("claude-4-sonnet%", "Claude 4 Sonnet", 3, 3.75, 0.3, 15),
+  cursorRate("claude-4.5-haiku%", "Claude 4.5 Haiku", 1, 1.25, 0.1, 5),
+  cursorRate("claude-4.5-opus%", "Claude 4.5 Opus", 5, 6.25, 0.5, 25),
+  cursorRate("claude-4.5-sonnet%", "Claude 4.5 Sonnet", 3, 3.75, 0.3, 15),
+  cursorRate("claude-4.6-opus%", "Claude 4.6 Opus", 5, 6.25, 0.5, 25),
+  cursorRate("claude-4.6-sonnet%", "Claude 4.6 Sonnet", 3, 3.75, 0.3, 15),
+  cursorRate("claude-opus-4.7-fast%", "Claude Opus 4.7 (fast mode)", 30, 37.5, 3, 150),
+  cursorRate("claude-4.7-opus%", "Claude 4.7 Opus", 5, 6.25, 0.5, 25),
+  cursorRate("claude-fable-5.1%", "Claude Fable 5.1", 10, 12.5, 0.25, 50),
+  cursorRate("claude-fable-5%", "Claude Fable 5", 10, 12.5, 1, 50),
+  cursorRate("claude-opus-4.8%", "Claude Opus 4.8", 5, 6.25, 0.5, 25),
+  cursorRate("claude-opus-5%", "Claude Opus 5", 5, 6.25, 0.5, 25),
+  cursorRate("claude-sonnet-5%", "Claude Sonnet 5", 2, 2.5, 0.2, 10),
+  cursorRate("gemini-2.5-flash%", "Gemini 2.5 Flash", 0.3, 0, 0.03, 2.5),
+  cursorRate("gemini-3-flash%", "Gemini 3 Flash", 0.5, 0, 0.05, 3),
+  cursorRate("gemini-3-pro-image-preview%", "Gemini 3 Pro Image Preview", 2, 0, 0.2, 12),
+  cursorRate("gemini-3-pro%", "Gemini 3 Pro", 2, 0, 0.2, 12),
+  cursorRate("gemini-3.1-pro%", "Gemini 3.1 Pro", 2, 0, 0.2, 12),
+  cursorRate("gemini-3.5-flash%", "Gemini 3.5 Flash", 1.5, 0, 0.15, 9),
+  cursorRate("gemini-3.6-flash%", "Gemini 3.6 Flash", 1.5, 0, 0.15, 7.5),
+  cursorRate("gemini-3.7-flash%", "Gemini 3.7 Flash", 0.75, 0, 0.075, 3.5),
+  cursorRate("gemini-3.8-flash%", "Gemini 3.8 Flash", 0.75, 0, 0.075, 3.5),
+  cursorRate("glm-5.2%", "GLM 5.2", 1.4, 0, 0.26, 4.4),
+  cursorRate("gpt-5-fast%", "GPT-5 Fast", 2.5, 0, 0.25, 20),
+  cursorRate("gpt-5-mini%", "GPT-5 Mini", 0.25, 0, 0.025, 2),
+  cursorRate("gpt-5-codex%", "GPT-5-Codex", 1.25, 0, 0.125, 10),
+  cursorRate("gpt-5.1-codex-max%", "GPT-5.1 Codex Max", 1.25, 0, 0.125, 10),
+  cursorRate("gpt-5.1-codex-mini%", "GPT-5.1 Codex Mini", 0.25, 0, 0.025, 2),
+  cursorRate("gpt-5.1-codex%", "GPT-5.1 Codex", 1.25, 0, 0.125, 10),
+  cursorRate("gpt-5.2-codex%", "GPT-5.2 Codex", 1.75, 0, 0.175, 14),
+  cursorRate("gpt-5.2%", "GPT-5.2", 1.75, 0, 0.175, 14),
+  cursorRate("gpt-5.3-codex%", "GPT-5.3 Codex", 1.75, 0, 0.175, 14),
+  cursorRate("gpt-5.4-mini%", "GPT-5.4 Mini", 0.75, 0, 0.075, 4.5),
+  cursorRate("gpt-5.4-nano%", "GPT-5.4 Nano", 0.2, 0, 0.02, 1.25),
+  cursorRate("gpt-5.4%", "GPT-5.4", 2.5, 0, 0.25, 15),
+  cursorRate("gpt-5.5%", "GPT-5.5", 5, 0, 0.5, 30),
+  cursorRate("gpt-5.6-luna%", "GPT-5.6 Luna", 0.2, 0.25, 0.02, 1.2),
+  cursorRate("gpt-5.6-sol%", "GPT-5.6 Sol", 4, 5, 0.4, 20),
+  cursorRate("gpt-5.6-terra%", "GPT-5.6 Terra", 2, 2.5, 0.2, 12),
+  cursorRate("gpt-5%", "GPT-5", 1.25, 0, 0.125, 10),
+  cursorRate("kimi-k2.7-code%", "Kimi K2.7 Code", 0.95, 0, 0.19, 4),
+  cursorRate("kimi-k3%", "Kimi K3", 3, 0, 0.3, 15),
+  cursorRate("muse-spark-1.3%", "Muse Spark 1.3", 1.25, 0, 0.15, 4.25),
+];
+
+function seedCursorPricing(dbHandle = db) {
+  const insert = dbHandle.prepare(`
+    INSERT OR IGNORE INTO cursor_model_pricing
+      (model_pattern, display_name, input_per_mtok, cache_write_per_mtok, cache_read_per_mtok, output_per_mtok)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  dbHandle.transaction((rows) => {
+    for (const row of rows) insert.run(...row);
+  })(DEFAULT_CURSOR_PRICING);
+}
+seedCursorPricing();
+
+// Fast requests have their own short AND long rate cards. Explicit published
+// values avoid applying a guessed multiplier to unsupported model/tier pairs.
+const GPT_FAST_LONG_RATES = {
+  "gpt-6-astra%": [40, 4, 50, 150],
+  "gpt-6-sol%": [8, 0.8, 10, 30],
+  "gpt-6-luna%": [0.4, 0.04, 0.5, 1.5],
+  "gpt-5.6-sol%": [16, 1.6, 20, 60],
+  "gpt-5.6-terra%": [8, 0.8, 10, 36],
+  "gpt-5.6-luna%": [0.8, 0.08, 1, 3.6],
+};
+const GPT_FAST_LONG_FIELDS = [
+  "fast_long_input_per_mtok",
+  "fast_long_cached_input_per_mtok",
+  "fast_long_cache_write_per_mtok",
+  "fast_long_output_per_mtok",
+];
+let addedGptFastLongColumns = false;
+for (const field of GPT_FAST_LONG_FIELDS) {
+  if (
+    !db
+      .prepare("PRAGMA table_info(gpt_model_pricing)")
+      .all()
+      .some((column) => column.name === field)
+  ) {
+    db.exec(`ALTER TABLE gpt_model_pricing ADD COLUMN ${field} REAL NOT NULL DEFAULT 0`);
+    addedGptFastLongColumns = true;
+  }
+}
+
 function seedGptPricing(dbHandle = db) {
   const insert = dbHandle.prepare(`
     INSERT OR IGNORE INTO gpt_model_pricing (
@@ -746,7 +891,13 @@ function seedGptPricing(dbHandle = db) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const seed = dbHandle.transaction((rows) => {
-    for (const row of rows) insert.run(...row);
+    const setLong = dbHandle.prepare(`UPDATE gpt_model_pricing SET
+      ${GPT_FAST_LONG_FIELDS.map((field) => `${field} = ?`).join(", ")} WHERE model_pattern = ?`);
+    for (const row of rows) {
+      if (insert.run(...row).changes) {
+        setLong.run(...(GPT_FAST_LONG_RATES[row[0]] || [0, 0, 0, 0]), row[0]);
+      }
+    }
   });
   seed(DEFAULT_GPT_PRICING);
 }
@@ -774,6 +925,56 @@ function repairLegacyGptPricing(dbHandle = db) {
   repair.run("gpt-5.4-nano%", 0.4, 0.04, 0, 1.875);
 }
 repairLegacyGptPricing();
+
+// Correct only exact shipped rate groups. Custom prices survive upgrades.
+// Fast-long backfill runs only when its columns are first added; an operator
+// can subsequently set them to zero without a later restart undoing that edit.
+function correctPublishedPricing(dbHandle = db, backfillFastLong = false) {
+  const fields = ["short", "long", "fast"].flatMap((prefix) =>
+    ["input", "cached_input", "cache_write", "output"].map((kind) => `${prefix}_${kind}_per_mtok`)
+  );
+  const stale = [
+    gptRate("gpt-6-astra%", "GPT-6 Astra", [10, 1, 12.5, 50], [20, 2, 25, 100]),
+    gptRate(
+      "gpt-5.6-sol%",
+      "GPT-5.6 Sol",
+      [5, 0.5, 6.25, 30],
+      [10, 1, 12.5, 60],
+      [10, 1, 12.5, 45]
+    ),
+  ];
+  dbHandle.transaction(() => {
+    const update = dbHandle.prepare(`UPDATE gpt_model_pricing SET
+      ${fields.map((field) => `${field} = ?`).join(", ")}
+      WHERE model_pattern = ? AND ${fields.map((field) => `${field} = ?`).join(" AND ")}`);
+    for (const old of stale) {
+      const current = DEFAULT_GPT_PRICING.find((row) => row[0] === old[0]);
+      update.run(...current.slice(2), old[0], ...old.slice(2));
+    }
+    if (backfillFastLong) {
+      const updateLong = dbHandle.prepare(`UPDATE gpt_model_pricing SET
+        ${GPT_FAST_LONG_FIELDS.map((field) => `${field} = ?`).join(", ")} WHERE model_pattern = ?`);
+      for (const row of dbHandle.prepare("SELECT * FROM gpt_model_pricing").all()) {
+        const defaults = DEFAULT_GPT_PRICING.find((entry) => entry[0] === row.model_pattern);
+        const isDefault =
+          defaults && fields.every((field, index) => row[field] === defaults[index + 2]);
+        // The old custom Fast rate applied at every context size. Copy it into
+        // the new band on upgrade so custom pricing retains that behavior.
+        const rates = isDefault
+          ? GPT_FAST_LONG_RATES[row.model_pattern] || [0, 0, 0, 0]
+          : fields.slice(8).map((field) => row[field]);
+        updateLong.run(...rates, row.model_pattern);
+      }
+    }
+    const removeFast =
+      dbHandle.prepare(`UPDATE model_pricing SET fast_input_per_mtok = 0, fast_output_per_mtok = 0
+      WHERE model_pattern = ? AND input_per_mtok = 5 AND output_per_mtok = 25
+      AND cache_read_per_mtok = 0.5 AND cache_write_per_mtok = 6.25 AND cache_write_1h_per_mtok = 10
+      AND fast_input_per_mtok = 30 AND fast_output_per_mtok = 150`);
+    for (const pattern of ["claude-opus-4-6%", "claude-opus-4-7%"]) removeFast.run(pattern);
+  })();
+}
+correctPublishedPricing(db, addedGptFastLongColumns);
 
 // Top-up: insert any default pattern that isn't already present. Preserves
 // user edits to existing rows — we only add what's missing, never overwrite.
@@ -1004,6 +1205,15 @@ try {
   db.prepare("SELECT card_prompt_preview FROM sessions LIMIT 1").get();
 } catch {
   db.prepare("ALTER TABLE sessions ADD COLUMN card_prompt_preview TEXT").run();
+}
+
+// A session's origin remote is an optional, opaque Git URL supplied by the
+// authenticated collector. Consumers can canonicalize it in their own trust
+// domain to map the same repository across different machine-local cwd paths.
+try {
+  db.prepare("SELECT repo_remote_url FROM sessions LIMIT 1").get();
+} catch {
+  db.prepare("ALTER TABLE sessions ADD COLUMN repo_remote_url TEXT").run();
 }
 
 // Dashboard run records predate provider-aware launching. Keep existing rows
@@ -1504,6 +1714,11 @@ const stmts = {
   setSessionTranscriptPath: db.prepare(
     "UPDATE sessions SET transcript_path = ? WHERE id = ? AND (transcript_path IS NULL OR transcript_path = '')"
   ),
+  // First observed remote wins. A later hook must not silently rewrite the
+  // repository identity that a client already used for cross-machine mapping.
+  setSessionRepoRemoteUrl: db.prepare(
+    "UPDATE sessions SET repo_remote_url = ? WHERE id = ? AND (repo_remote_url IS NULL OR repo_remote_url = '')"
+  ),
   // Used only when an imported Codex snapshot is promoted to its matching live
   // rollout. The byte cursors move with it in codex-ingest before this pointer
   // changes, so a later watcher pass continues from the accounted offset.
@@ -1699,7 +1914,7 @@ const stmts = {
      FROM events
      WHERE session_id = ? AND event_type IN (
        'TaskCreated', 'TaskCompleted',
-       'UserPromptSubmit', 'Stop', 'SubagentStop', 'SessionEnd', 'Interrupted'
+       'UserPromptSubmit', 'cursor_user_message', 'Stop', 'SubagentStop', 'SessionEnd', 'Interrupted'
      )
      ORDER BY created_at ASC, id ASC`
   ),
@@ -1964,7 +2179,26 @@ const stmts = {
       fast_output_per_mtok = excluded.fast_output_per_mtok,
       updated_at = excluded.updated_at
   `),
+  setGptFastLongPricing: db.prepare(`UPDATE gpt_model_pricing SET
+    ${GPT_FAST_LONG_FIELDS.map((field) => `${field} = ?`).join(", ")} WHERE model_pattern = ?`),
   deleteGptPricing: db.prepare("DELETE FROM gpt_model_pricing WHERE model_pattern = ?"),
+  // Cursor pricing uses the four columns published by Cursor for both native
+  // and routed third-party models.
+  listCursorPricing: db.prepare("SELECT * FROM cursor_model_pricing ORDER BY display_name ASC"),
+  getCursorPricing: db.prepare("SELECT * FROM cursor_model_pricing WHERE model_pattern = ?"),
+  upsertCursorPricing: db.prepare(`
+    INSERT INTO cursor_model_pricing
+      (model_pattern, display_name, input_per_mtok, cache_write_per_mtok, cache_read_per_mtok, output_per_mtok, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    ON CONFLICT(model_pattern) DO UPDATE SET
+      display_name = excluded.display_name,
+      input_per_mtok = excluded.input_per_mtok,
+      cache_write_per_mtok = excluded.cache_write_per_mtok,
+      cache_read_per_mtok = excluded.cache_read_per_mtok,
+      output_per_mtok = excluded.output_per_mtok,
+      updated_at = excluded.updated_at
+  `),
+  deleteCursorPricing: db.prepare("DELETE FROM cursor_model_pricing WHERE model_pattern = ?"),
   toolUsageCounts: db.prepare(`
     SELECT tool_name, COUNT(*) as count
     FROM events
@@ -2209,8 +2443,12 @@ module.exports = {
   DB_PATH,
   DEFAULT_PRICING,
   DEFAULT_GPT_PRICING,
+  DEFAULT_CURSOR_PRICING,
   applyIntroPricing,
   correctSonnet5StandardRate,
   seedGptPricing,
+  seedCursorPricing,
   repairLegacyGptPricing,
+  correctPublishedPricing,
+  GPT_FAST_LONG_FIELDS,
 };
